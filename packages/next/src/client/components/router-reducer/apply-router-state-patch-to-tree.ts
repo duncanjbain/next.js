@@ -1,8 +1,11 @@
-import {
+import type {
   FlightRouterState,
   FlightSegmentPath,
-} from '../../../server/app-render'
+} from '../../../server/app-render/types'
+import { DEFAULT_SEGMENT_KEY } from '../../../shared/lib/segment'
+import { getNextFlightSegmentPath } from '../../flight-data-helpers'
 import { matchSegment } from '../match-segments'
+import { addRefreshMarkerToActiveParallelSegments } from './refetch-inactive-parallel-segments'
 
 /**
  * Deep merge of the two router states. Parallel route keys are preserved if the patch doesn't have them.
@@ -11,33 +14,44 @@ function applyPatch(
   initialTree: FlightRouterState,
   patchTree: FlightRouterState
 ): FlightRouterState {
-  const [segment, parallelRoutes] = initialTree
+  const [initialSegment, initialParallelRoutes] = initialTree
+  const [patchSegment, patchParallelRoutes] = patchTree
 
-  if (matchSegment(segment, patchTree[0])) {
+  // if the applied patch segment is __DEFAULT__ then it can be ignored in favor of the initial tree
+  // this is because the __DEFAULT__ segment is used as a placeholder on navigation
+  if (
+    patchSegment === DEFAULT_SEGMENT_KEY &&
+    initialSegment !== DEFAULT_SEGMENT_KEY
+  ) {
+    return initialTree
+  }
+
+  if (matchSegment(initialSegment, patchSegment)) {
     const newParallelRoutes: FlightRouterState[1] = {}
-    for (const key in parallelRoutes) {
+    for (const key in initialParallelRoutes) {
       const isInPatchTreeParallelRoutes =
-        typeof patchTree[1][key] !== 'undefined'
+        typeof patchParallelRoutes[key] !== 'undefined'
       if (isInPatchTreeParallelRoutes) {
         newParallelRoutes[key] = applyPatch(
-          parallelRoutes[key],
-          patchTree[1][key]
+          initialParallelRoutes[key],
+          patchParallelRoutes[key]
         )
       } else {
-        newParallelRoutes[key] = parallelRoutes[key]
+        newParallelRoutes[key] = initialParallelRoutes[key]
       }
     }
 
-    for (const key in patchTree[1]) {
+    for (const key in patchParallelRoutes) {
       if (newParallelRoutes[key]) {
         continue
       }
 
-      newParallelRoutes[key] = patchTree[1][key]
+      newParallelRoutes[key] = patchParallelRoutes[key]
     }
 
-    const tree: FlightRouterState = [segment, newParallelRoutes]
+    const tree: FlightRouterState = [initialSegment, newParallelRoutes]
 
+    // Copy over the existing tree
     if (initialTree[2]) {
       tree[2] = initialTree[2]
     }
@@ -55,19 +69,26 @@ function applyPatch(
 
   return patchTree
 }
+
 /**
- * Apply the router state from the Flight response. Creates a new router state tree.
+ * Apply the router state from the Flight response, but skip patching default segments.
+ * Useful for patching the router cache when navigating, where we persist the existing default segment if there isn't a new one.
+ * Creates a new router state tree.
  */
 export function applyRouterStatePatchToTree(
   flightSegmentPath: FlightSegmentPath,
   flightRouterState: FlightRouterState,
-  treePatch: FlightRouterState
+  treePatch: FlightRouterState,
+  path: string
 ): FlightRouterState | null {
-  const [segment, parallelRoutes, , , isRootLayout] = flightRouterState
+  const [segment, parallelRoutes, url, refetch, isRootLayout] =
+    flightRouterState
 
   // Root refresh
   if (flightSegmentPath.length === 1) {
     const tree: FlightRouterState = applyPatch(flightRouterState, treePatch)
+
+    addRefreshMarkerToActiveParallelSegments(tree, path)
 
     return tree
   }
@@ -83,12 +104,13 @@ export function applyRouterStatePatchToTree(
 
   let parallelRoutePatch
   if (lastSegment) {
-    parallelRoutePatch = treePatch
+    parallelRoutePatch = applyPatch(parallelRoutes[parallelRouteKey], treePatch)
   } else {
     parallelRoutePatch = applyRouterStatePatchToTree(
-      flightSegmentPath.slice(2),
+      getNextFlightSegmentPath(flightSegmentPath),
       parallelRoutes[parallelRouteKey],
-      treePatch
+      treePatch,
+      path
     )
 
     if (parallelRoutePatch === null) {
@@ -102,12 +124,16 @@ export function applyRouterStatePatchToTree(
       ...parallelRoutes,
       [parallelRouteKey]: parallelRoutePatch,
     },
+    url,
+    refetch,
   ]
 
   // Current segment is the root layout
   if (isRootLayout) {
     tree[4] = true
   }
+
+  addRefreshMarkerToActiveParallelSegments(tree, path)
 
   return tree
 }

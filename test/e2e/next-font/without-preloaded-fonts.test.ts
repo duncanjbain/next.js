@@ -1,6 +1,6 @@
 import cheerio from 'cheerio'
 import { createNext, FileRef } from 'e2e-utils'
-import { NextInstance } from 'test/lib/next-modes/base'
+import { NextInstance } from 'e2e-utils'
 import { renderViaHTTP } from 'next-test-utils'
 import { join } from 'path'
 
@@ -24,9 +24,6 @@ describe('next/font/google without-preloaded-fonts without _app', () => {
         ),
         'pages/without-fonts.js': new FileRef(
           join(__dirname, 'without-preloaded-fonts/pages/without-fonts.js')
-        ),
-        'next.config.js': new FileRef(
-          join(__dirname, 'without-preloaded-fonts/next.config.js')
         ),
       },
       env: {
@@ -81,9 +78,6 @@ describe('next/font/google no preloads with _app', () => {
         ),
         'pages/without-fonts.js': new FileRef(
           join(__dirname, 'without-preloaded-fonts/pages/without-fonts.js')
-        ),
-        'next.config.js': new FileRef(
-          join(__dirname, 'without-preloaded-fonts/next.config.js')
         ),
       },
       env: {

@@ -1,7 +1,4 @@
 module.exports = {
-  experimental: {
-    appDir: true,
-  },
   redirects: () => {
     return [
       {
@@ -10,5 +7,10 @@ module.exports = {
         permanent: false,
       },
     ]
+  },
+  // scroll position can be finicky with the
+  // indicators showing so hide by default
+  devIndicators: {
+    appIsrStatus: false,
   },
 }

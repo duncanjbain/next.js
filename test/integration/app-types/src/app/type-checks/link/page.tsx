@@ -1,4 +1,5 @@
-import type { Route, Metadata } from 'next'
+'use client'
+import type { Route } from 'next'
 import Link from 'next/link'
 
 export function Card<T extends string>({ href }: { href: Route<T> | URL }) {
@@ -31,6 +32,7 @@ export default function page() {
       <Link href="/rewrite-one-or-more">test</Link>
       <Link href="/rewrite-param/page">test</Link>
       <Link href="/rewrite-param/x/page1">test</Link>
+      <Link href="/redirect/v2/guides/x/page">test</Link>
     </>
   )
 
@@ -40,6 +42,7 @@ export default function page() {
       <Card href="/aaa" />
       <Card href="/blog/a/b?1" />
       <Link href="/about">test</Link>
+      <Link href="/mdx-test" />
       <Link href="/aaa#aaa">test</Link>
       <Link href="/aaa?q=1">test</Link>
       <Link href="/blog/a/b">test</Link>
@@ -58,7 +61,14 @@ export default function page() {
       <Link href="/rewrite-all/x/y/z">test</Link>
       <Link href="/rewrite-param/x/page?1">test</Link>
       <Link href="/redirect">test</Link>
-      <Link href={new URL('/about')}>test</Link>
+      <Link href="/redirect/v1/guides/x/page">test</Link>
+      <Link href="/redirect/guides/x/page">test</Link>
+      <Link href={new URL('https://nextjs.org')}>test</Link>
+      <Link href="https://nextjs.org">test</Link>
+      <Link href="http://nextjs.org">test</Link>
+      <Link href="#id">test</Link>
+      <Link href="?page=1">test</Link>
+      <Link href="mailto:foo@example.com">test</Link>
     </>
   )
 
@@ -68,8 +78,4 @@ export default function page() {
       {shouldPass}
     </>
   )
-}
-
-export const metadata: Metadata = {
-  title: 'test',
 }

@@ -27,14 +27,14 @@ describe('next/font/google loader', () => {
         'https://fonts.googleapis.com/css2?family=Inter:wght@900&display=block',
       ],
       [
-        'Source_Sans_Pro',
+        'Source_Sans_3',
         { weight: '900', display: 'auto' },
-        'https://fonts.googleapis.com/css2?family=Source+Sans+Pro:wght@900&display=auto',
+        'https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@900&display=auto',
       ],
       [
-        'Source_Sans_Pro',
+        'Source_Sans_3',
         { weight: '200', style: 'italic' },
-        'https://fonts.googleapis.com/css2?family=Source+Sans+Pro:ital,wght@1,200&display=swap',
+        'https://fonts.googleapis.com/css2?family=Source+Sans+3:ital,wght@1,200&display=swap',
       ],
       [
         'Roboto_Flex',
@@ -126,8 +126,13 @@ describe('next/font/google loader', () => {
         })
         const { css } = await nextFontGoogleFontLoader({
           functionName,
-          data: [{ adjustFontFallback: false, ...fontFunctionArguments }],
-          config: { subsets: [] },
+          data: [
+            {
+              adjustFontFallback: false,
+              subsets: [],
+              ...fontFunctionArguments,
+            },
+          ],
           emitFontFile: jest.fn(),
           resolve: jest.fn(),
           loaderContext: {} as any,
