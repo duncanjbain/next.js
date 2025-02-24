@@ -1,16 +1,22 @@
 import { type NextRequest } from 'next/server'
 import { withRequestMeta } from '../helpers'
 
-export const helloHandler = async (
+const helloHandler = async (
   request: NextRequest,
-  { params }: { params?: Record<string, string | string[]> }
+  { params }: { params?: Promise<Record<string, string | string[]>> }
 ): Promise<Response> => {
   const { pathname } = request.nextUrl
+
+  if (typeof WebSocket === 'undefined') {
+    throw new Error('missing WebSocket constructor!!')
+  }
+
+  const resolvedParams = params ? await params : null
 
   return new Response('hello, world', {
     headers: withRequestMeta({
       method: request.method,
-      params: params ?? null,
+      params: resolvedParams,
       pathname,
     }),
   })
