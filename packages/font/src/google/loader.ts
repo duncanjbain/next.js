@@ -28,7 +28,6 @@ function escapeStringRegexp(str: string) {
 const nextFontGoogleFontLoader: FontLoader = async ({
   functionName,
   data,
-  config,
   emitFontFile,
   isDev,
   isServer,
@@ -44,7 +43,7 @@ const nextFontGoogleFontLoader: FontLoader = async ({
     adjustFontFallback,
     variable,
     subsets,
-  } = validateGoogleFontFunctionCall(functionName, data[0], config)
+  } = validateGoogleFontFunctionCall(functionName, data[0])
 
   // Validate and get the font axes required to generated the URL
   const fontAxes = getFontAxes(
@@ -96,7 +95,7 @@ const nextFontGoogleFontLoader: FontLoader = async ({
     }
 
     // CSS Variables may be set on a body tag, ignore them to keep the CSS module pure
-    fontFaceDeclarations = fontFaceDeclarations.split('body {')[0]
+    fontFaceDeclarations = fontFaceDeclarations.split('body {', 1)[0]
 
     // Find font files to download, provide the array of subsets we want to preload if preloading is enabled
     const fontFiles = findFontFilesInCss(
@@ -165,7 +164,9 @@ const nextFontGoogleFontLoader: FontLoader = async ({
     if (isDev) {
       if (isServer) {
         Log.error(
-          `Failed to download \`${fontFamily}\` from Google Fonts. Using fallback font instead.`
+          `Failed to download \`${fontFamily}\` from Google Fonts. Using fallback font instead.\n\n${
+            (err as Error).message
+          }}`
         )
       }
 
