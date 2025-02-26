@@ -1,8 +1,5 @@
-import React, { ReactElement, ReactNode, useContext } from 'react'
-import {
-  OPTIMIZED_FONT_PROVIDERS,
-  NEXT_BUILTIN_DOCUMENT,
-} from '../shared/lib/constants'
+import React, { type JSX } from 'react'
+import { NEXT_BUILTIN_DOCUMENT } from '../shared/lib/constants'
 import type {
   DocumentContext,
   DocumentInitialProps,
@@ -13,18 +10,26 @@ import type {
 import type { ScriptProps } from '../client/script'
 import type { NextFontManifest } from '../build/webpack/plugins/next-font-manifest-plugin'
 
-import { BuildManifest, getPageFiles } from '../server/get-page-files'
+import { getPageFiles } from '../server/get-page-files'
+import type { BuildManifest } from '../server/get-page-files'
 import { htmlEscapeJsonString } from '../server/htmlescape'
 import isError from '../lib/is-error'
 
-import { HtmlContext } from '../shared/lib/html-context'
-import type { HtmlProps } from '../shared/lib/html-context'
+import {
+  HtmlContext,
+  useHtmlContext,
+} from '../shared/lib/html-context.shared-runtime'
+import type { HtmlProps } from '../shared/lib/html-context.shared-runtime'
+import { encodeURIPath } from '../shared/lib/encode-uri-path'
+import type { DeepReadonly } from '../shared/lib/deep-readonly'
+import { getTracer } from '../server/lib/trace/tracer'
+import { getTracedMetadata } from '../server/lib/trace/utils'
 
-export { DocumentContext, DocumentInitialProps, DocumentProps }
+export type { DocumentContext, DocumentInitialProps, DocumentProps }
 
 export type OriginProps = {
   nonce?: string
-  crossOrigin?: string
+  crossOrigin?: 'anonymous' | 'use-credentials' | '' | undefined
   children?: React.ReactNode
 }
 
@@ -68,7 +73,7 @@ function getPolyfillScripts(context: HtmlProps, props: OriginProps) {
   const {
     assetPrefix,
     buildManifest,
-    devOnlyCacheBusterQueryString,
+    assetQueryString,
     disableOptimizedLoading,
     crossOrigin,
   } = context
@@ -84,24 +89,26 @@ function getPolyfillScripts(context: HtmlProps, props: OriginProps) {
         nonce={props.nonce}
         crossOrigin={props.crossOrigin || crossOrigin}
         noModule={true}
-        src={`${assetPrefix}/_next/${polyfill}${devOnlyCacheBusterQueryString}`}
+        src={`${assetPrefix}/_next/${encodeURIPath(
+          polyfill
+        )}${assetQueryString}`}
       />
     ))
 }
 
-function hasComponentProps(child: any): child is React.ReactElement {
+function hasComponentProps(child: any): child is React.ReactElement<any> {
   return !!child && !!child.props
 }
 
 function AmpStyles({
   styles,
 }: {
-  styles?: React.ReactElement[] | React.ReactFragment
+  styles?: React.ReactElement[] | Iterable<React.ReactNode>
 }) {
   if (!styles) return null
 
   // try to parse styles from fragment for backwards compat
-  const curStyles: React.ReactElement[] = Array.isArray(styles)
+  const curStyles: React.ReactElement<any>[] = Array.isArray(styles)
     ? (styles as React.ReactElement[])
     : []
   if (
@@ -110,7 +117,7 @@ function AmpStyles({
     // @ts-ignore Property 'props' does not exist on type ReactElement
     Array.isArray(styles.props.children)
   ) {
-    const hasStyles = (el: React.ReactElement) =>
+    const hasStyles = (el: React.ReactElement<any>) =>
       el?.props?.dangerouslySetInnerHTML?.__html
     // @ts-ignore Property 'props' does not exist on type ReactElement
     styles.props.children.forEach((child: React.ReactElement) => {
@@ -146,7 +153,7 @@ function getDynamicChunks(
     dynamicImports,
     assetPrefix,
     isDevelopment,
-    devOnlyCacheBusterQueryString,
+    assetQueryString,
     disableOptimizedLoading,
     crossOrigin,
   } = context
@@ -159,9 +166,7 @@ function getDynamicChunks(
         async={!isDevelopment && disableOptimizedLoading}
         defer={!disableOptimizedLoading}
         key={file}
-        src={`${assetPrefix}/_next/${encodeURI(
-          file
-        )}${devOnlyCacheBusterQueryString}`}
+        src={`${assetPrefix}/_next/${encodeURIPath(file)}${assetQueryString}`}
         nonce={props.nonce}
         crossOrigin={props.crossOrigin || crossOrigin}
       />
@@ -178,7 +183,7 @@ function getScripts(
     assetPrefix,
     buildManifest,
     isDevelopment,
-    devOnlyCacheBusterQueryString,
+    assetQueryString,
     disableOptimizedLoading,
     crossOrigin,
   } = context
@@ -192,9 +197,7 @@ function getScripts(
     return (
       <script
         key={file}
-        src={`${assetPrefix}/_next/${encodeURI(
-          file
-        )}${devOnlyCacheBusterQueryString}`}
+        src={`${assetPrefix}/_next/${encodeURIPath(file)}${assetQueryString}`}
         nonce={props.nonce}
         async={!isDevelopment && disableOptimizedLoading}
         defer={!disableOptimizedLoading}
@@ -259,9 +262,7 @@ function getPreNextWorkerScripts(context: HtmlProps, props: OriginProps) {
 
           let srcProps: {
             src?: string
-            dangerouslySetInnerHTML?: {
-              __html: string
-            }
+            dangerouslySetInnerHTML?: ScriptProps['dangerouslySetInnerHTML']
           } = {}
 
           if (src) {
@@ -282,8 +283,8 @@ function getPreNextWorkerScripts(context: HtmlProps, props: OriginProps) {
                 typeof scriptChildren === 'string'
                   ? scriptChildren
                   : Array.isArray(scriptChildren)
-                  ? scriptChildren.join('')
-                  : '',
+                    ? scriptChildren.join('')
+                    : '',
             }
           } else {
             throw new Error(
@@ -358,7 +359,7 @@ function getAmpPath(ampPath: string, asPath: string): string {
 }
 
 function getNextFontLinkTags(
-  nextFontManifest: NextFontManifest | undefined,
+  nextFontManifest: DeepReadonly<NextFontManifest> | undefined,
   dangerousAsPath: string,
   assetPrefix: string = ''
 ) {
@@ -372,10 +373,9 @@ function getNextFontLinkTags(
   const appFontsEntry = nextFontManifest.pages['/_app']
   const pageFontsEntry = nextFontManifest.pages[dangerousAsPath]
 
-  const preloadedFontFiles = [
-    ...(appFontsEntry ?? []),
-    ...(pageFontsEntry ?? []),
-  ]
+  const preloadedFontFiles = Array.from(
+    new Set([...(appFontsEntry ?? []), ...(pageFontsEntry ?? [])])
+  )
 
   // If no font files should preload but there's an entry for the path, add a preconnect tag.
   const preconnectToSelf = !!(
@@ -401,7 +401,7 @@ function getNextFontLinkTags(
             <link
               key={fontFile}
               rel="preload"
-              href={`${assetPrefix}/_next/${encodeURI(fontFile)}`}
+              href={`${assetPrefix}/_next/${encodeURIPath(fontFile)}`}
               as="font"
               type={`font/${ext}`}
               crossOrigin="anonymous"
@@ -422,38 +422,40 @@ function getNextFontLinkTags(
 export class Head extends React.Component<HeadProps> {
   static contextType = HtmlContext
 
-  context!: React.ContextType<typeof HtmlContext>
+  context!: HtmlProps
 
   getCssLinks(files: DocumentFiles): JSX.Element[] | null {
     const {
       assetPrefix,
-      devOnlyCacheBusterQueryString,
+      assetQueryString,
       dynamicImports,
+      dynamicCssManifest,
       crossOrigin,
       optimizeCss,
-      optimizeFonts,
     } = this.context
     const cssFiles = files.allFiles.filter((f) => f.endsWith('.css'))
     const sharedFiles: Set<string> = new Set(files.sharedFiles)
 
     // Unmanaged files are CSS files that will be handled directly by the
     // webpack runtime (`mini-css-extract-plugin`).
-    let unmangedFiles: Set<string> = new Set([])
-    let dynamicCssFiles = Array.from(
+    let unmanagedFiles: Set<string> = new Set([])
+    let localDynamicCssFiles = Array.from(
       new Set(dynamicImports.filter((file) => file.endsWith('.css')))
     )
-    if (dynamicCssFiles.length) {
+    if (localDynamicCssFiles.length) {
       const existing = new Set(cssFiles)
-      dynamicCssFiles = dynamicCssFiles.filter(
+      localDynamicCssFiles = localDynamicCssFiles.filter(
         (f) => !(existing.has(f) || sharedFiles.has(f))
       )
-      unmangedFiles = new Set(dynamicCssFiles)
-      cssFiles.push(...dynamicCssFiles)
+      unmanagedFiles = new Set(localDynamicCssFiles)
+      cssFiles.push(...localDynamicCssFiles)
     }
 
     let cssLinkElements: JSX.Element[] = []
     cssFiles.forEach((file) => {
       const isSharedFile = sharedFiles.has(file)
+      const isUnmanagedFile = unmanagedFiles.has(file)
+      const isFileInDynamicCssManifest = dynamicCssManifest.has(file)
 
       if (!optimizeCss) {
         cssLinkElements.push(
@@ -461,47 +463,40 @@ export class Head extends React.Component<HeadProps> {
             key={`${file}-preload`}
             nonce={this.props.nonce}
             rel="preload"
-            href={`${assetPrefix}/_next/${encodeURI(
+            href={`${assetPrefix}/_next/${encodeURIPath(
               file
-            )}${devOnlyCacheBusterQueryString}`}
+            )}${assetQueryString}`}
             as="style"
             crossOrigin={this.props.crossOrigin || crossOrigin}
           />
         )
       }
 
-      const isUnmanagedFile = unmangedFiles.has(file)
       cssLinkElements.push(
         <link
           key={file}
           nonce={this.props.nonce}
           rel="stylesheet"
-          href={`${assetPrefix}/_next/${encodeURI(
+          href={`${assetPrefix}/_next/${encodeURIPath(
             file
-          )}${devOnlyCacheBusterQueryString}`}
+          )}${assetQueryString}`}
           crossOrigin={this.props.crossOrigin || crossOrigin}
           data-n-g={isUnmanagedFile ? undefined : isSharedFile ? '' : undefined}
-          data-n-p={isUnmanagedFile ? undefined : isSharedFile ? undefined : ''}
+          data-n-p={
+            isSharedFile || isUnmanagedFile || isFileInDynamicCssManifest
+              ? undefined
+              : ''
+          }
         />
       )
     })
-
-    if (process.env.NODE_ENV !== 'development' && optimizeFonts) {
-      cssLinkElements = this.makeStylesheetInert(
-        cssLinkElements
-      ) as ReactElement[]
-    }
 
     return cssLinkElements.length === 0 ? null : cssLinkElements
   }
 
   getPreloadDynamicChunks() {
-    const {
-      dynamicImports,
-      assetPrefix,
-      devOnlyCacheBusterQueryString,
-      crossOrigin,
-    } = this.context
+    const { dynamicImports, assetPrefix, assetQueryString, crossOrigin } =
+      this.context
 
     return (
       dynamicImports
@@ -514,9 +509,9 @@ export class Head extends React.Component<HeadProps> {
             <link
               rel="preload"
               key={file}
-              href={`${assetPrefix}/_next/${encodeURI(
+              href={`${assetPrefix}/_next/${encodeURIPath(
                 file
-              )}${devOnlyCacheBusterQueryString}`}
+              )}${assetQueryString}`}
               as="script"
               nonce={this.props.nonce}
               crossOrigin={this.props.crossOrigin || crossOrigin}
@@ -529,12 +524,8 @@ export class Head extends React.Component<HeadProps> {
   }
 
   getPreloadMainLinks(files: DocumentFiles): JSX.Element[] | null {
-    const {
-      assetPrefix,
-      devOnlyCacheBusterQueryString,
-      scriptLoader,
-      crossOrigin,
-    } = this.context
+    const { assetPrefix, assetQueryString, scriptLoader, crossOrigin } =
+      this.context
     const preloadFiles = files.allFiles.filter((file: string) => {
       return file.endsWith('.js')
     })
@@ -555,9 +546,9 @@ export class Head extends React.Component<HeadProps> {
           key={file}
           nonce={this.props.nonce}
           rel="preload"
-          href={`${assetPrefix}/_next/${encodeURI(
+          href={`${assetPrefix}/_next/${encodeURIPath(
             file
-          )}${devOnlyCacheBusterQueryString}`}
+          )}${assetQueryString}`}
           as="script"
           crossOrigin={this.props.crossOrigin || crossOrigin}
         />
@@ -582,7 +573,9 @@ export class Head extends React.Component<HeadProps> {
           src,
           ...scriptProps
         } = file
-        let html = ''
+        let html: NonNullable<
+          ScriptProps['dangerouslySetInnerHTML']
+        >['__html'] = ''
 
         if (dangerouslySetInnerHTML && dangerouslySetInnerHTML.__html) {
           html = dangerouslySetInnerHTML.__html
@@ -591,8 +584,8 @@ export class Head extends React.Component<HeadProps> {
             typeof children === 'string'
               ? children
               : Array.isArray(children)
-              ? children.join('')
-              : ''
+                ? children.join('')
+                : ''
         }
 
         return (
@@ -602,7 +595,10 @@ export class Head extends React.Component<HeadProps> {
             key={scriptProps.id || index}
             nonce={nonce}
             data-nscript="beforeInteractive"
-            crossOrigin={crossOrigin || process.env.__NEXT_CROSS_ORIGIN}
+            crossOrigin={
+              crossOrigin ||
+              (process.env.__NEXT_CROSS_ORIGIN as typeof crossOrigin)
+            }
           />
         )
       })
@@ -624,35 +620,6 @@ export class Head extends React.Component<HeadProps> {
     return getPolyfillScripts(this.context, this.props)
   }
 
-  makeStylesheetInert(node: ReactNode): ReactNode[] {
-    return React.Children.map(node, (c: any) => {
-      if (
-        c?.type === 'link' &&
-        c?.props?.href &&
-        OPTIMIZED_FONT_PROVIDERS.some(({ url }) =>
-          c?.props?.href?.startsWith(url)
-        )
-      ) {
-        const newProps = {
-          ...(c.props || {}),
-          'data-href': c.props.href,
-          href: undefined,
-        }
-
-        return React.cloneElement(c, newProps)
-      } else if (c?.props?.children) {
-        const newProps = {
-          ...(c.props || {}),
-          children: this.makeStylesheetInert(c.props.children),
-        }
-
-        return React.cloneElement(c, newProps)
-      }
-
-      return c
-    }).filter(Boolean)
-  }
-
   render() {
     const {
       styles,
@@ -667,7 +634,6 @@ export class Head extends React.Component<HeadProps> {
       unstable_JsPreload,
       disableOptimizedLoading,
       optimizeCss,
-      optimizeFonts,
       assetPrefix,
       nextFontManifest,
     } = this.context
@@ -682,21 +648,37 @@ export class Head extends React.Component<HeadProps> {
     let cssPreloads: Array<JSX.Element> = []
     let otherHeadElements: Array<JSX.Element> = []
     if (head) {
-      head.forEach((c) => {
+      head.forEach((child) => {
         if (
-          c &&
-          c.type === 'link' &&
-          c.props['rel'] === 'preload' &&
-          c.props['as'] === 'style'
+          child &&
+          child.type === 'link' &&
+          child.props['rel'] === 'preload' &&
+          child.props['as'] === 'style'
         ) {
-          cssPreloads.push(c)
+          if (this.context.strictNextHead) {
+            cssPreloads.push(
+              React.cloneElement(child, { 'data-next-head': '' })
+            )
+          } else {
+            cssPreloads.push(child)
+          }
         } else {
-          c && otherHeadElements.push(c)
+          if (child) {
+            if (this.context.strictNextHead) {
+              otherHeadElements.push(
+                React.cloneElement(child, { 'data-next-head': '' })
+              )
+            } else {
+              otherHeadElements.push(child)
+            }
+          }
         }
       })
       head = cssPreloads.concat(otherHeadElements)
     }
-    let children = React.Children.toArray(this.props.children).filter(Boolean)
+    let children: React.ReactNode[] = React.Children.toArray(
+      this.props.children
+    ).filter(Boolean)
     // show a warning if Head contains <title> (only in development)
     if (process.env.NODE_ENV !== 'production') {
       children = React.Children.map(children, (child: any) => {
@@ -716,19 +698,12 @@ export class Head extends React.Component<HeadProps> {
           }
         }
         return child
-      })
+        // @types/react bug. Returned value from .map will not be `null` if you pass in `[null]`
+      })!
       if (this.props.crossOrigin)
         console.warn(
           'Warning: `Head` attribute `crossOrigin` is deprecated. https://nextjs.org/docs/messages/doc-crossorigin-deprecated'
         )
-    }
-
-    if (
-      process.env.NODE_ENV !== 'development' &&
-      optimizeFonts &&
-      !(process.env.NEXT_RUNTIME !== 'edge' && inAmpMode)
-    ) {
-      children = this.makeStylesheetInert(children)
     }
 
     let hasAmphtmlRel = false
@@ -776,7 +751,8 @@ export class Head extends React.Component<HeadProps> {
         }
       }
       return child
-    })
+      // @types/react bug. Returned value from .map will not be `null` if you pass in `[null]`
+    })!
 
     const files: DocumentFiles = getDocumentFiles(
       this.context.buildManifest,
@@ -788,6 +764,17 @@ export class Head extends React.Component<HeadProps> {
       nextFontManifest,
       dangerousAsPath,
       assetPrefix
+    )
+
+    const tracingMetadata = getTracedMetadata(
+      getTracer().getTracePropagationData(),
+      this.context.experimentalClientTraceMetadata
+    )
+
+    const traceMetaTags = (tracingMetadata || []).map(
+      ({ key, value }, index) => (
+        <meta key={`next-trace-data-${index}`} name={key} content={value} />
+      )
     )
 
     return (
@@ -822,13 +809,14 @@ export class Head extends React.Component<HeadProps> {
           </>
         )}
         {head}
-        <meta
-          name="next-head-count"
-          content={React.Children.count(head || []).toString()}
-        />
+        {this.context.strictNextHead ? null : (
+          <meta
+            name="next-head-count"
+            content={React.Children.count(head || []).toString()}
+          />
+        )}
 
         {children}
-        {optimizeFonts && <meta name="next-font-preconnect" />}
 
         {nextFontLinkTags.preconnect}
         {nextFontLinkTags.preload}
@@ -913,6 +901,7 @@ export class Head extends React.Component<HeadProps> {
               // (by default, style-loader injects at the bottom of <head />)
               <noscript id="__next_css__DO_NOT_USE__" />
             )}
+            {traceMetaTags}
             {styles || null}
           </>
         )}
@@ -969,6 +958,9 @@ function handleDocumentScriptLoaderItems(
       ) {
         scriptLoaderItems.push(child.props)
         return
+      } else if (typeof child.props.strategy === 'undefined') {
+        scriptLoaderItems.push({ ...child.props, strategy: 'afterInteractive' })
+        return
       }
     }
   })
@@ -979,7 +971,7 @@ function handleDocumentScriptLoaderItems(
 export class NextScript extends React.Component<OriginProps> {
   static contextType = HtmlContext
 
-  context!: React.ContextType<typeof HtmlContext>
+  context!: HtmlProps
 
   getDynamicChunks(files: DocumentFiles) {
     return getDynamicChunks(this.context, this.props, files)
@@ -1048,7 +1040,7 @@ export class NextScript extends React.Component<OriginProps> {
       buildManifest,
       unstable_runtimeJS,
       docComponentsRendered,
-      devOnlyCacheBusterQueryString,
+      assetQueryString,
       disableOptimizedLoading,
       crossOrigin,
     } = this.context
@@ -1083,7 +1075,9 @@ export class NextScript extends React.Component<OriginProps> {
           {ampDevFiles.map((file) => (
             <script
               key={file}
-              src={`${assetPrefix}/_next/${file}${devOnlyCacheBusterQueryString}`}
+              src={`${assetPrefix}/_next/${encodeURIPath(
+                file
+              )}${assetQueryString}`}
               nonce={this.props.nonce}
               crossOrigin={this.props.crossOrigin || crossOrigin}
               data-ampdevmode
@@ -1112,9 +1106,9 @@ export class NextScript extends React.Component<OriginProps> {
           ? buildManifest.devFiles.map((file: string) => (
               <script
                 key={file}
-                src={`${assetPrefix}/_next/${encodeURI(
+                src={`${assetPrefix}/_next/${encodeURIPath(
                   file
-                )}${devOnlyCacheBusterQueryString}`}
+                )}${assetQueryString}`}
                 nonce={this.props.nonce}
                 crossOrigin={this.props.crossOrigin || crossOrigin}
               />
@@ -1158,7 +1152,7 @@ export function Html(
     locale,
     scriptLoader,
     __NEXT_DATA__,
-  } = useContext(HtmlContext)
+  } = useHtmlContext()
 
   docComponentsRendered.Html = true
   handleDocumentScriptLoaderItems(scriptLoader, __NEXT_DATA__, props)
@@ -1180,7 +1174,7 @@ export function Html(
 }
 
 export function Main() {
-  const { docComponentsRendered } = useContext(HtmlContext)
+  const { docComponentsRendered } = useHtmlContext()
   docComponentsRendered.Main = true
   // @ts-ignore
   return <next-js-internal-body-render-target />

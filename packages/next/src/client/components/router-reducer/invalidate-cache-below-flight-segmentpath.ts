@@ -1,5 +1,7 @@
-import { CacheNode } from '../../../shared/lib/app-router-context'
-import { FlightSegmentPath } from '../../../server/app-render'
+import type { CacheNode } from '../../../shared/lib/app-router-context.shared-runtime'
+import type { FlightSegmentPath } from '../../../server/app-render/types'
+import { createRouterCacheKey } from './create-router-cache-key'
+import { getNextFlightSegmentPath } from '../../flight-data-helpers'
 
 /**
  * Fill cache up to the end of the flightSegmentPath, invalidating anything below it.
@@ -12,7 +14,7 @@ export function invalidateCacheBelowFlightSegmentPath(
   const isLastEntry = flightSegmentPath.length <= 2
   const [parallelRouteKey, segment] = flightSegmentPath
 
-  const segmentForCache = Array.isArray(segment) ? segment[1] : segment
+  const cacheKey = createRouterCacheKey(segment)
 
   const existingChildSegmentMap =
     existingCache.parallelRoutes.get(parallelRouteKey)
@@ -31,12 +33,12 @@ export function invalidateCacheBelowFlightSegmentPath(
 
   // In case of last entry don't copy further down.
   if (isLastEntry) {
-    childSegmentMap.delete(segmentForCache)
+    childSegmentMap.delete(cacheKey)
     return
   }
 
-  const existingChildCacheNode = existingChildSegmentMap.get(segmentForCache)
-  let childCacheNode = childSegmentMap.get(segmentForCache)
+  const existingChildCacheNode = existingChildSegmentMap.get(cacheKey)
+  let childCacheNode = childSegmentMap.get(cacheKey)
 
   if (!childCacheNode || !existingChildCacheNode) {
     // Bailout because the existing cache does not have the path to the leaf node
@@ -46,17 +48,19 @@ export function invalidateCacheBelowFlightSegmentPath(
 
   if (childCacheNode === existingChildCacheNode) {
     childCacheNode = {
-      status: childCacheNode.status,
-      data: childCacheNode.data,
-      subTreeData: childCacheNode.subTreeData,
+      lazyData: childCacheNode.lazyData,
+      rsc: childCacheNode.rsc,
+      prefetchRsc: childCacheNode.prefetchRsc,
+      head: childCacheNode.head,
+      prefetchHead: childCacheNode.prefetchHead,
       parallelRoutes: new Map(childCacheNode.parallelRoutes),
     } as CacheNode
-    childSegmentMap.set(segmentForCache, childCacheNode)
+    childSegmentMap.set(cacheKey, childCacheNode)
   }
 
   invalidateCacheBelowFlightSegmentPath(
     childCacheNode,
     existingChildCacheNode,
-    flightSegmentPath.slice(2)
+    getNextFlightSegmentPath(flightSegmentPath)
   )
 }

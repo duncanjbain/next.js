@@ -1,28 +1,15 @@
-import { DynamicServerError } from './hooks-server-context'
-import { staticGenerationAsyncStorage } from './static-generation-async-storage'
+const NEXT_STATIC_GEN_BAILOUT = 'NEXT_STATIC_GEN_BAILOUT'
 
-export function staticGenerationBailout(reason: string): boolean | never {
-  const staticGenerationStore = staticGenerationAsyncStorage.getStore()
+export class StaticGenBailoutError extends Error {
+  public readonly code = NEXT_STATIC_GEN_BAILOUT
+}
 
-  if (staticGenerationStore?.forceStatic) {
-    return true
+export function isStaticGenBailoutError(
+  error: unknown
+): error is StaticGenBailoutError {
+  if (typeof error !== 'object' || error === null || !('code' in error)) {
+    return false
   }
 
-  if (staticGenerationStore?.dynamicShouldError) {
-    throw new Error(
-      `Page with \`dynamic = "error"\` couldn't be rendered statically because it used \`${reason}\``
-    )
-  }
-
-  if (staticGenerationStore?.isStaticGeneration) {
-    staticGenerationStore.revalidate = 0
-    const err = new DynamicServerError(reason)
-
-    staticGenerationStore.dynamicUsageDescription = reason
-    staticGenerationStore.dynamicUsageStack = err.stack
-
-    throw err
-  }
-
-  return false
+  return error.code === NEXT_STATIC_GEN_BAILOUT
 }

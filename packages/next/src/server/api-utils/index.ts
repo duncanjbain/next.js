@@ -1,8 +1,15 @@
 import type { IncomingMessage } from 'http'
 import type { BaseNextRequest } from '../base-http'
-
-import { NextApiRequest, NextApiResponse } from '../../shared/lib/utils'
 import type { CookieSerializeOptions } from 'next/dist/compiled/cookie'
+import type { NextApiResponse } from '../../shared/lib/utils'
+
+import { HeadersAdapter } from '../web/spec-extension/adapters/headers'
+import {
+  PRERENDER_REVALIDATE_HEADER,
+  PRERENDER_REVALIDATE_ONLY_GENERATED_HEADER,
+} from '../../lib/constants'
+import { getTracer } from '../lib/trace/tracer'
+import { NodeSpan } from '../lib/trace/constants'
 
 export type NextApiRequestCookies = Partial<{ [key: string]: string }>
 export type NextApiRequestQuery = Partial<{ [key: string]: string | string[] }>
@@ -13,23 +20,21 @@ export type __ApiPreviewProps = {
   previewModeSigningKey: string
 }
 
-/**
- * Parse cookies from the `headers` of request
- * @param req request object
- */
-export function getCookieParser(headers: {
-  [key: string]: undefined | string | string[]
-}): () => NextApiRequestCookies {
-  return function parseCookie(): NextApiRequestCookies {
-    const header: undefined | string | string[] = headers.cookie
-
-    if (!header) {
-      return {}
-    }
-
-    const { parse: parseCookieFn } = require('next/dist/compiled/cookie')
-    return parseCookieFn(Array.isArray(header) ? header.join(';') : header)
-  }
+export function wrapApiHandler<T extends (...args: any[]) => any>(
+  page: string,
+  handler: T
+): T {
+  return ((...args) => {
+    getTracer().setRootSpanAttribute('next.route', page)
+    // Call API route method
+    return getTracer().trace(
+      NodeSpan.runHandler,
+      {
+        spanName: `executing api route (pages) ${page}`,
+      },
+      () => handler(...args)
+    )
+  }) as T
 }
 
 /**
@@ -71,23 +76,23 @@ export function redirect(
   return res
 }
 
-export const PRERENDER_REVALIDATE_HEADER = 'x-prerender-revalidate'
-export const PRERENDER_REVALIDATE_ONLY_GENERATED_HEADER =
-  'x-prerender-revalidate-if-generated'
-
-export function checkIsManualRevalidate(
-  req: IncomingMessage | BaseNextRequest,
+export function checkIsOnDemandRevalidate(
+  req: Request | IncomingMessage | BaseNextRequest,
   previewProps: __ApiPreviewProps
 ): {
-  isManualRevalidate: boolean
+  isOnDemandRevalidate: boolean
   revalidateOnlyGenerated: boolean
 } {
-  return {
-    isManualRevalidate:
-      req.headers[PRERENDER_REVALIDATE_HEADER] === previewProps.previewModeId,
-    revalidateOnlyGenerated:
-      !!req.headers[PRERENDER_REVALIDATE_ONLY_GENERATED_HEADER],
-  }
+  const headers = HeadersAdapter.from(req.headers)
+
+  const previewModeId = headers.get(PRERENDER_REVALIDATE_HEADER)
+  const isOnDemandRevalidate = previewModeId === previewProps.previewModeId
+
+  const revalidateOnlyGenerated = headers.has(
+    PRERENDER_REVALIDATE_ONLY_GENERATED_HEADER
+  )
+
+  return { isOnDemandRevalidate, revalidateOnlyGenerated }
 }
 
 export const COOKIE_NAME_PRERENDER_BYPASS = `__prerender_bypass`
@@ -115,8 +120,8 @@ export function clearPreviewData<T>(
     ...(typeof previous === 'string'
       ? [previous]
       : Array.isArray(previous)
-      ? previous
-      : []),
+        ? previous
+        : []),
     serialize(COOKIE_NAME_PRERENDER_BYPASS, '', {
       // To delete a cookie, set `expires` to a date in the past:
       // https://tools.ietf.org/html/rfc6265#section-4.1.1
@@ -181,7 +186,7 @@ export function sendError(
 }
 
 interface LazyProps {
-  req: NextApiRequest
+  req: IncomingMessage
 }
 
 /**
