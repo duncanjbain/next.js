@@ -7,14 +7,16 @@ import {
   isPositionInsideNode,
 } from '../utils'
 
-const TYPE_ANOTATION = ': Metadata'
-const TYPE_ANOTATION_ASYNC = ': Promise<Metadata>'
+import type tsModule from 'typescript/lib/tsserverlibrary'
+
+const TYPE_ANNOTATION = ': Metadata | null'
+const TYPE_ANNOTATION_ASYNC = ': Promise<Metadata | null>'
 const TYPE_IMPORT = `\n\nimport type { Metadata } from 'next'`
 
 // Find the `export const metadata = ...` node.
 function getMetadataExport(fileName: string, position: number) {
   const source = getSource(fileName)
-  let metadataExport: ts.VariableDeclaration | undefined
+  let metadataExport: tsModule.VariableDeclaration | undefined
 
   if (source) {
     const ts = getTs()
@@ -47,14 +49,14 @@ function getMetadataExport(fileName: string, position: number) {
   return metadataExport
 }
 
-let cachedProxiedLanguageService: ts.LanguageService | undefined
-let cachedProxiedLanguageServiceHost: ts.LanguageServiceHost | undefined
+let cachedProxiedLanguageService: tsModule.LanguageService | undefined
+let cachedProxiedLanguageServiceHost: tsModule.LanguageServiceHost | undefined
 function getProxiedLanguageService() {
   if (cachedProxiedLanguageService)
     return {
-      languageService: cachedProxiedLanguageService as ts.LanguageService,
+      languageService: cachedProxiedLanguageService as tsModule.LanguageService,
       languageServiceHost:
-        cachedProxiedLanguageServiceHost as ts.LanguageServiceHost & {
+        cachedProxiedLanguageServiceHost as tsModule.LanguageServiceHost & {
           addFile: (fileName: string, body: string) => void
         },
     }
@@ -62,9 +64,10 @@ function getProxiedLanguageService() {
   const languageServiceHost = getInfo().languageServiceHost
 
   const ts = getTs()
-  class ProxiedLanguageServiceHost implements ts.LanguageServiceHost {
-    files: { [fileName: string]: { file: ts.IScriptSnapshot; ver: number } } =
-      {}
+  class ProxiedLanguageServiceHost implements tsModule.LanguageServiceHost {
+    files: {
+      [fileName: string]: { file: tsModule.IScriptSnapshot; ver: number }
+    } = {}
 
     log = () => {}
     trace = () => {}
@@ -133,9 +136,9 @@ function getProxiedLanguageService() {
     ts.createDocumentRegistry()
   )
   return {
-    languageService: cachedProxiedLanguageService as ts.LanguageService,
+    languageService: cachedProxiedLanguageService as tsModule.LanguageService,
     languageServiceHost:
-      cachedProxiedLanguageServiceHost as ts.LanguageServiceHost & {
+      cachedProxiedLanguageServiceHost as tsModule.LanguageServiceHost & {
         addFile: (fileName: string, body: string) => void
       },
   }
@@ -143,13 +146,13 @@ function getProxiedLanguageService() {
 
 function updateVirtualFileWithType(
   fileName: string,
-  node: ts.VariableDeclaration | ts.FunctionDeclaration,
+  node: tsModule.VariableDeclaration | tsModule.FunctionDeclaration,
   isGenerateMetadata?: boolean
 ) {
   const source = getSource(fileName)
   if (!source) return
 
-  // We annotate with the type in a vritual language service
+  // We annotate with the type in a virtual language service
   const sourceText = source.getFullText()
   let nodeEnd: number
   let annotation: string
@@ -161,13 +164,13 @@ function updateVirtualFileWithType(
       const isAsync = node.modifiers?.some(
         (m) => m.kind === ts.SyntaxKind.AsyncKeyword
       )
-      annotation = isAsync ? TYPE_ANOTATION_ASYNC : TYPE_ANOTATION
+      annotation = isAsync ? TYPE_ANNOTATION_ASYNC : TYPE_ANNOTATION
     } else {
       return
     }
   } else {
     nodeEnd = node.name.getFullStart() + node.name.getFullWidth()
-    annotation = TYPE_ANOTATION
+    annotation = TYPE_ANNOTATION
   }
 
   const newSource =
@@ -181,14 +184,16 @@ function updateVirtualFileWithType(
   return [nodeEnd, annotation.length]
 }
 
-function isTyped(node: ts.VariableDeclaration | ts.FunctionDeclaration) {
+function isTyped(
+  node: tsModule.VariableDeclaration | tsModule.FunctionDeclaration
+) {
   return node.type !== undefined
 }
 
 function proxyDiagnostics(
   fileName: string,
   pos: number[],
-  n: ts.VariableDeclaration | ts.FunctionDeclaration
+  n: tsModule.VariableDeclaration | tsModule.FunctionDeclaration
 ) {
   // Get diagnostics
   const { languageService } = getProxiedLanguageService()
@@ -221,7 +226,7 @@ const metadata = {
     fileName: string,
     position: number,
     _options: any,
-    prior: ts.WithMetadata<ts.CompletionInfo>
+    prior: tsModule.WithMetadata<tsModule.CompletionInfo>
   ) {
     const node = getMetadataExport(fileName, position)
     if (!node) return prior
@@ -229,7 +234,7 @@ const metadata = {
 
     const ts = getTs()
 
-    // We annotate with the type in a vritual language service
+    // We annotate with the type in a virtual language service
     const pos = updateVirtualFileWithType(fileName, node)
     if (pos === undefined) return prior
 
@@ -281,7 +286,7 @@ const metadata = {
 
   getSemanticDiagnosticsForExportVariableStatementInClientEntry(
     fileName: string,
-    node: ts.VariableStatement | ts.FunctionDeclaration
+    node: tsModule.VariableStatement | tsModule.FunctionDeclaration
   ) {
     const source = getSource(fileName)
     const ts = getTs()
@@ -322,7 +327,7 @@ const metadata = {
 
   getSemanticDiagnosticsForExportVariableStatement(
     fileName: string,
-    node: ts.VariableStatement | ts.FunctionDeclaration
+    node: tsModule.VariableStatement | tsModule.FunctionDeclaration
   ) {
     const ts = getTs()
 
@@ -330,7 +335,7 @@ const metadata = {
       if (node.name?.getText() === 'generateMetadata') {
         if (isTyped(node)) return []
 
-        // We annotate with the type in a vritual language service
+        // We annotate with the type in a virtual language service
         const pos = updateVirtualFileWithType(fileName, node, true)
         if (!pos) return []
 
@@ -341,7 +346,7 @@ const metadata = {
         if (declaration.name.getText() === 'metadata') {
           if (isTyped(declaration)) break
 
-          // We annotate with the type in a vritual language service
+          // We annotate with the type in a virtual language service
           const pos = updateVirtualFileWithType(fileName, declaration)
           if (!pos) break
 
@@ -354,11 +359,11 @@ const metadata = {
 
   getSemanticDiagnosticsForExportDeclarationInClientEntry(
     fileName: string,
-    node: ts.ExportDeclaration
+    node: tsModule.ExportDeclaration
   ) {
     const ts = getTs()
     const source = getSource(fileName)
-    const diagnostics: ts.Diagnostic[] = []
+    const diagnostics: tsModule.Diagnostic[] = []
 
     const exportClause = node.exportClause
     if (exportClause && ts.isNamedExports(exportClause)) {
@@ -381,7 +386,7 @@ const metadata = {
 
   getSemanticDiagnosticsForExportDeclaration(
     fileName: string,
-    node: ts.ExportDeclaration
+    node: tsModule.ExportDeclaration
   ) {
     const ts = getTs()
 
@@ -404,7 +409,7 @@ const metadata = {
                     declaration.getSourceFile().fileName
                   const isSameFile = declarationFileName === fileName
 
-                  // We annotate with the type in a vritual language service
+                  // We annotate with the type in a virtual language service
                   const pos = updateVirtualFileWithType(
                     declarationFileName,
                     declaration
@@ -425,7 +430,7 @@ const metadata = {
                           file: getSource(fileName),
                           category: ts.DiagnosticCategory.Error,
                           code: NEXT_TS_ERRORS.INVALID_METADATA_EXPORT,
-                          messageText: `The 'metadata' export value is not typed correctly, please make sure it is typed as 'Metadata':\nhttps://beta.nextjs.org/docs/guides/seo#static-metadata`,
+                          messageText: `The 'metadata' export value is not typed correctly, please make sure it is typed as 'Metadata':\nhttps://nextjs.org/docs/app/building-your-application/optimizing/metadata#static-metadata`,
                           start: e.name.getStart(),
                           length: e.name.getWidth(),
                         },
@@ -447,16 +452,16 @@ const metadata = {
     fileName: string,
     position: number,
     entryName: string,
-    formatOptions: ts.FormatCodeOptions,
+    formatOptions: tsModule.FormatCodeOptions,
     source: string,
-    preferences: ts.UserPreferences,
-    data: ts.CompletionEntryData
+    preferences: tsModule.UserPreferences,
+    data: tsModule.CompletionEntryData
   ) {
     const node = getMetadataExport(fileName, position)
     if (!node) return
     if (isTyped(node)) return
 
-    // We annotate with the type in a vritual language service
+    // We annotate with the type in a virtual language service
     const pos = updateVirtualFileWithType(fileName, node)
     if (pos === undefined) return
 
@@ -480,7 +485,7 @@ const metadata = {
     if (!node) return
     if (isTyped(node)) return
 
-    // We annotate with the type in a vritual language service
+    // We annotate with the type in a virtual language service
     const pos = updateVirtualFileWithType(fileName, node)
     if (pos === undefined) return
 
@@ -495,7 +500,7 @@ const metadata = {
     if (!node) return
     if (isTyped(node)) return
     if (!isPositionInsideNode(position, node)) return
-    // We annotate with the type in a vritual language service
+    // We annotate with the type in a virtual language service
     const pos = updateVirtualFileWithType(fileName, node)
     if (pos === undefined) return
     const { languageService } = getProxiedLanguageService()

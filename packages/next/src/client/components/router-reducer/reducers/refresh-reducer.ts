@@ -1,105 +1,150 @@
 import { fetchServerResponse } from '../fetch-server-response'
-import { createRecordFromThenable } from '../create-record-from-thenable'
-import { readRecordValue } from '../read-record-value'
 import { createHrefFromUrl } from '../create-href-from-url'
 import { applyRouterStatePatchToTree } from '../apply-router-state-patch-to-tree'
 import { isNavigatingToNewRootLayout } from '../is-navigating-to-new-root-layout'
-import {
+import type {
+  Mutable,
   ReadonlyReducerState,
   ReducerState,
   RefreshAction,
 } from '../router-reducer-types'
-import {
-  handleMutable,
-  applyFlightData,
-  handleExternalUrl,
-} from './navigate-reducer'
+import { handleExternalUrl } from './navigate-reducer'
+import { handleMutable } from '../handle-mutable'
+import type { CacheNode } from '../../../../shared/lib/app-router-context.shared-runtime'
+import { fillLazyItemsTillLeafWithHead } from '../fill-lazy-items-till-leaf-with-head'
+import { createEmptyCacheNode } from '../../app-router'
+import { handleSegmentMismatch } from '../handle-segment-mismatch'
+import { hasInterceptionRouteInCurrentTree } from './has-interception-route-in-current-tree'
+import { refreshInactiveParallelSegments } from '../refetch-inactive-parallel-segments'
+import { revalidateEntireCache } from '../../segment-cache'
 
 export function refreshReducer(
   state: ReadonlyReducerState,
   action: RefreshAction
 ): ReducerState {
-  const { cache, mutable, origin } = action
+  const { origin } = action
+  const mutable: Mutable = {}
   const href = state.canonicalUrl
 
-  const isForCurrentTree =
-    JSON.stringify(mutable.previousTree) === JSON.stringify(state.tree)
+  let currentTree = state.tree
 
-  if (isForCurrentTree) {
-    return handleMutable(state, mutable)
-  }
+  mutable.preserveCustomHistoryState = false
 
-  if (!cache.data) {
-    // TODO-APP: verify that `href` is not an external url.
-    // Fetch data from the root of the tree.
-    cache.data = createRecordFromThenable(
-      fetchServerResponse(new URL(href, origin), [
-        state.tree[0],
-        state.tree[1],
-        state.tree[2],
-        'refetch',
-      ])
-    )
-  }
-  const [flightData, canonicalUrlOverride] = readRecordValue(cache.data!)
+  const cache: CacheNode = createEmptyCacheNode()
 
-  // Handle case when navigating to page in `pages` from `app`
-  if (typeof flightData === 'string') {
-    return handleExternalUrl(
-      state,
-      mutable,
-      flightData,
-      state.pushRef.pendingPush
-    )
-  }
+  // If the current tree was intercepted, the nextUrl should be included in the request.
+  // This is to ensure that the refresh request doesn't get intercepted, accidentally triggering the interception route.
+  const includeNextUrl = hasInterceptionRouteInCurrentTree(state.tree)
 
-  // Remove cache.data as it has been resolved at this point.
-  cache.data = null
+  // TODO-APP: verify that `href` is not an external url.
+  // Fetch data from the root of the tree.
+  cache.lazyData = fetchServerResponse(new URL(href, origin), {
+    flightRouterState: [
+      currentTree[0],
+      currentTree[1],
+      currentTree[2],
+      'refetch',
+    ],
+    nextUrl: includeNextUrl ? state.nextUrl : null,
+  })
 
-  // TODO-APP: Currently the Flight data can only have one item but in the future it can have multiple paths.
-  const flightDataPath = flightData[0]
+  return cache.lazyData.then(
+    async ({ flightData, canonicalUrl: canonicalUrlOverride }) => {
+      // Handle case when navigating to page in `pages` from `app`
+      if (typeof flightData === 'string') {
+        return handleExternalUrl(
+          state,
+          mutable,
+          flightData,
+          state.pushRef.pendingPush
+        )
+      }
 
-  // FlightDataPath with more than two items means unexpected Flight data was returned
-  if (flightDataPath.length !== 3) {
-    // TODO-APP: handle this case better
-    console.log('REFRESH FAILED')
-    return state
-  }
+      // Remove cache.lazyData as it has been resolved at this point.
+      cache.lazyData = null
 
-  // Given the path can only have two items the items are only the router state and subTreeData for the root.
-  const [treePatch] = flightDataPath
-  const newTree = applyRouterStatePatchToTree(
-    // TODO-APP: remove ''
-    [''],
-    state.tree,
-    treePatch
+      for (const normalizedFlightData of flightData) {
+        const {
+          tree: treePatch,
+          seedData: cacheNodeSeedData,
+          head,
+          isRootRender,
+        } = normalizedFlightData
+
+        if (!isRootRender) {
+          // TODO-APP: handle this case better
+          console.log('REFRESH FAILED')
+          return state
+        }
+
+        const newTree = applyRouterStatePatchToTree(
+          // TODO-APP: remove ''
+          [''],
+          currentTree,
+          treePatch,
+          state.canonicalUrl
+        )
+
+        if (newTree === null) {
+          return handleSegmentMismatch(state, action, treePatch)
+        }
+
+        if (isNavigatingToNewRootLayout(currentTree, newTree)) {
+          return handleExternalUrl(
+            state,
+            mutable,
+            href,
+            state.pushRef.pendingPush
+          )
+        }
+
+        const canonicalUrlOverrideHref = canonicalUrlOverride
+          ? createHrefFromUrl(canonicalUrlOverride)
+          : undefined
+
+        if (canonicalUrlOverride) {
+          mutable.canonicalUrl = canonicalUrlOverrideHref
+        }
+
+        // Handles case where prefetch only returns the router tree patch without rendered components.
+        if (cacheNodeSeedData !== null) {
+          const rsc = cacheNodeSeedData[1]
+          const loading = cacheNodeSeedData[3]
+          cache.rsc = rsc
+          cache.prefetchRsc = null
+          cache.loading = loading
+          fillLazyItemsTillLeafWithHead(
+            cache,
+            // Existing cache is not passed in as `router.refresh()` has to invalidate the entire cache.
+            undefined,
+            treePatch,
+            cacheNodeSeedData,
+            head,
+            undefined
+          )
+          if (process.env.__NEXT_CLIENT_SEGMENT_CACHE) {
+            revalidateEntireCache(state.nextUrl, newTree)
+          } else {
+            mutable.prefetchCache = new Map()
+          }
+        }
+
+        await refreshInactiveParallelSegments({
+          state,
+          updatedTree: newTree,
+          updatedCache: cache,
+          includeNextUrl,
+          canonicalUrl: mutable.canonicalUrl || state.canonicalUrl,
+        })
+
+        mutable.cache = cache
+        mutable.patchedTree = newTree
+
+        currentTree = newTree
+      }
+
+      return handleMutable(state, mutable)
+    },
+    () => state
   )
-
-  if (newTree === null) {
-    throw new Error('SEGMENT MISMATCH')
-  }
-
-  if (isNavigatingToNewRootLayout(state.tree, newTree)) {
-    return handleExternalUrl(state, mutable, href, state.pushRef.pendingPush)
-  }
-
-  const canonicalUrlOverrideHref = canonicalUrlOverride
-    ? createHrefFromUrl(canonicalUrlOverride)
-    : undefined
-
-  if (canonicalUrlOverride) {
-    mutable.canonicalUrl = canonicalUrlOverrideHref
-  }
-
-  const applied = applyFlightData(state, cache, flightDataPath)
-
-  if (applied) {
-    mutable.cache = cache
-  }
-
-  mutable.previousTree = state.tree
-  mutable.patchedTree = newTree
-  mutable.canonicalUrl = href
-
-  return handleMutable(state, mutable)
 }

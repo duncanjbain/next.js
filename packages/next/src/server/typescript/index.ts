@@ -10,11 +10,12 @@
 
 import {
   init,
-  getIsClientEntry,
+  getEntryInfo,
   isAppEntryFile,
   isDefaultFunctionExport,
   isPositionInsideNode,
   getSource,
+  isInsideApp,
 } from './utils'
 import { NEXT_TS_ERRORS } from './constant'
 
@@ -22,14 +23,19 @@ import entryConfig from './rules/config'
 import serverLayer from './rules/server'
 import entryDefault from './rules/entry'
 import clientBoundary from './rules/client-boundary'
+import serverBoundary from './rules/server-boundary'
 import metadata from './rules/metadata'
+import errorEntry from './rules/error'
+import type tsModule from 'typescript/lib/tsserverlibrary'
 
-export function createTSPlugin(modules: {
-  typescript: typeof import('typescript/lib/tsserverlibrary')
-}) {
-  const ts = modules.typescript
+type NextTypePluginOptions = {
+  enabled?: boolean
+}
 
-  function create(info: ts.server.PluginCreateInfo) {
+export const createTSPlugin: tsModule.server.PluginModuleFactory = ({
+  typescript: ts,
+}) => {
+  function create(info: tsModule.server.PluginCreateInfo) {
     init({
       ts,
       info,
@@ -40,6 +46,13 @@ export function createTSPlugin(modules: {
     for (let k of Object.keys(info.languageService)) {
       const x = (info.languageService as any)[k]
       proxy[k] = (...args: Array<{}>) => x.apply(info.languageService, args)
+    }
+
+    const pluginOptions: NextTypePluginOptions = info.config ?? {
+      enabled: true,
+    }
+    if (!pluginOptions.enabled) {
+      return proxy
     }
 
     // Auto completion
@@ -61,7 +74,8 @@ export function createTSPlugin(modules: {
       if (!isAppEntryFile(fileName)) return prior
 
       // If it's a server entry.
-      if (!getIsClientEntry(fileName)) {
+      const entryInfo = getEntryInfo(fileName)
+      if (!entryInfo.client) {
         // Remove specified entries from completion list
         prior.entries = serverLayer.filterCompletionsAtPosition(prior.entries)
 
@@ -89,7 +103,7 @@ export function createTSPlugin(modules: {
           prior.entries.push(
             ...entryDefault.getCompletionsAtPosition(
               fileName,
-              node as ts.FunctionDeclaration,
+              node as tsModule.FunctionDeclaration,
               position
             )
           )
@@ -104,10 +118,10 @@ export function createTSPlugin(modules: {
       fileName: string,
       position: number,
       entryName: string,
-      formatOptions: ts.FormatCodeOptions,
+      formatOptions: tsModule.FormatCodeOptions,
       source: string,
-      preferences: ts.UserPreferences,
-      data: ts.CompletionEntryData
+      preferences: tsModule.UserPreferences,
+      data: tsModule.CompletionEntryData
     ) => {
       const entryCompletionEntryDetails = entryConfig.getCompletionEntryDetails(
         entryName,
@@ -146,7 +160,8 @@ export function createTSPlugin(modules: {
       if (!isAppEntryFile(fileName)) return prior
 
       // Remove type suggestions for disallowed APIs in server components.
-      if (!getIsClientEntry(fileName)) {
+      const entryInfo = getEntryInfo(fileName)
+      if (!entryInfo.client) {
         const definitions = info.languageService.getDefinitionAtPosition(
           fileName,
           position
@@ -162,8 +177,8 @@ export function createTSPlugin(modules: {
         if (metadataInfo) return metadataInfo
       }
 
-      const overriden = entryConfig.getQuickInfoAtPosition(fileName, position)
-      if (overriden) return overriden
+      const overridden = entryConfig.getQuickInfoAtPosition(fileName, position)
+      if (overridden) return overridden
 
       return prior
     }
@@ -175,25 +190,37 @@ export function createTSPlugin(modules: {
       if (!source) return prior
 
       let isClientEntry = false
+      let isServerEntry = false
       const isAppEntry = isAppEntryFile(fileName)
 
       try {
-        isClientEntry = getIsClientEntry(fileName, true)
+        const entryInfo = getEntryInfo(fileName, true)
+        isClientEntry = entryInfo.client
+        isServerEntry = entryInfo.server
       } catch (e: any) {
         prior.push({
           file: source,
           category: ts.DiagnosticCategory.Error,
-          code: NEXT_TS_ERRORS.MISPLACED_CLIENT_ENTRY,
+          code: NEXT_TS_ERRORS.MISPLACED_ENTRY_DIRECTIVE,
           ...e,
         })
         isClientEntry = false
+        isServerEntry = false
+      }
+
+      if (isInsideApp(fileName)) {
+        const errorDiagnostic = errorEntry.getSemanticDiagnostics(
+          source!,
+          isClientEntry
+        )
+        prior.push(...errorDiagnostic)
       }
 
       ts.forEachChild(source!, (node) => {
         if (ts.isImportDeclaration(node)) {
           // import ...
           if (isAppEntry) {
-            if (!isClientEntry) {
+            if (!isClientEntry || isServerEntry) {
               // Check if it has valid imports in the server layer
               const diagnostics =
                 serverLayer.getSemanticDiagnosticsForImportDeclaration(
@@ -235,6 +262,15 @@ export function createTSPlugin(modules: {
               )
             )
           }
+
+          if (isServerEntry) {
+            prior.push(
+              ...serverBoundary.getSemanticDiagnosticsForExportVariableStatement(
+                source,
+                node
+              )
+            )
+          }
         } else if (isDefaultFunctionExport(node)) {
           // export default function ...
           if (isAppEntry) {
@@ -249,6 +285,15 @@ export function createTSPlugin(modules: {
           if (isClientEntry) {
             prior.push(
               ...clientBoundary.getSemanticDiagnosticsForFunctionExport(
+                source,
+                node
+              )
+            )
+          }
+
+          if (isServerEntry) {
+            prior.push(
+              ...serverBoundary.getSemanticDiagnosticsForFunctionExport(
                 source,
                 node
               )
@@ -280,6 +325,15 @@ export function createTSPlugin(modules: {
               )
             )
           }
+
+          if (isServerEntry) {
+            prior.push(
+              ...serverBoundary.getSemanticDiagnosticsForFunctionExport(
+                source,
+                node
+              )
+            )
+          }
         } else if (ts.isExportDeclaration(node)) {
           // export { ... }
           if (isAppEntry) {
@@ -294,6 +348,15 @@ export function createTSPlugin(modules: {
                 )
             prior.push(...metadataDiagnostics)
           }
+
+          if (isServerEntry) {
+            prior.push(
+              ...serverBoundary.getSemanticDiagnosticsForExportDeclaration(
+                source,
+                node
+              )
+            )
+          }
         }
       })
 
@@ -302,7 +365,8 @@ export function createTSPlugin(modules: {
 
     // Get definition and link for specific node
     proxy.getDefinitionAndBoundSpan = (fileName: string, position: number) => {
-      if (isAppEntryFile(fileName) && !getIsClientEntry(fileName)) {
+      const entryInfo = getEntryInfo(fileName)
+      if (isAppEntryFile(fileName) && !entryInfo.client) {
         const metadataDefinition = metadata.getDefinitionAndBoundSpan(
           fileName,
           position

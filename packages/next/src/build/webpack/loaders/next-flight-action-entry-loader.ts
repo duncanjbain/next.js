@@ -1,40 +1,35 @@
-import { generateActionId } from './utils'
+import type { webpack } from 'next/dist/compiled/webpack/webpack'
 
 export type NextFlightActionEntryLoaderOptions = {
   actions: string
 }
 
-function nextFlightActionEntryLoader(this: any) {
+export type FlightActionEntryLoaderActions = [
+  path: string,
+  actions: { id: string; exportedName: string }[],
+][]
+
+function nextFlightActionEntryLoader(
+  this: webpack.LoaderContext<NextFlightActionEntryLoaderOptions>
+) {
   const { actions }: NextFlightActionEntryLoaderOptions = this.getOptions()
 
-  const actionList = JSON.parse(actions) as [string, string[]][]
+  const actionList = JSON.parse(actions) as FlightActionEntryLoaderActions
+  const individualActions = actionList
+    .map(([path, actionsFromModule]) => {
+      return actionsFromModule.map(({ id, exportedName }) => {
+        return [id, path, exportedName] as const
+      })
+    })
+    .flat()
 
   return `
-const actions = {
-${actionList
-  .map(([path, names]) => {
-    return names
-      .map(
-        (name) =>
-          `  '${generateActionId(
-            path,
-            name
-          )}': () => import(/* webpackMode: "eager" */ ${JSON.stringify(
-            path
-          )}).then(mod => mod[${JSON.stringify(name)}]),`
-      )
-      .join('\n')
+${individualActions
+  .map(([id, path, exportedName]) => {
+    // Re-export the same functions from the original module path as action IDs.
+    return `export { ${exportedName} as "${id}" } from ${JSON.stringify(path)}`
   })
   .join('\n')}
-}
-
-async function endpoint(id, bound) {
-  const action = await actions[id]()
-  return action.apply(null, bound)
-}
-
-// Using "export default" will cause this to be tree-shaken away due to unused exports.
-module.exports = endpoint
 `
 }
 
