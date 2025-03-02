@@ -1,52 +1,101 @@
 #!/usr/bin/env node
-import arg from 'next/dist/compiled/arg/index.js'
-import { startServer, WORKER_SELF_EXIT_CODE } from '../server/lib/start-server'
-import { getPort, printAndExit } from '../server/lib/utils'
+
+import '../server/lib/cpu-profile'
+import type { StartServerOptions } from '../server/lib/start-server'
+import {
+  RESTART_EXIT_CODE,
+  getNodeDebugType,
+  getParsedDebugAddress,
+  getMaxOldSpaceSize,
+  getParsedNodeOptionsWithoutInspect,
+  printAndExit,
+  formatNodeOptions,
+  formatDebugAddress,
+} from '../server/lib/utils'
 import * as Log from '../build/output/log'
-import { startedDevelopmentServer } from '../build/output'
-import { CliCommand } from '../lib/commands'
-import isError from '../lib/is-error'
 import { getProjectDir } from '../lib/get-project-dir'
-import { CONFIG_FILES, PHASE_DEVELOPMENT_SERVER } from '../shared/lib/constants'
+import { PHASE_DEVELOPMENT_SERVER } from '../shared/lib/constants'
 import path from 'path'
-import type { NextConfig } from '../../types'
 import type { NextConfigComplete } from '../server/config-shared'
-import { traceGlobals } from '../trace/shared'
-import { isIPv6 } from 'net'
-import { ChildProcess, fork } from 'child_process'
+import { setGlobal, traceGlobals } from '../trace/shared'
 import { Telemetry } from '../telemetry/storage'
 import loadConfig from '../server/config'
 import { findPagesDir } from '../lib/find-pages-dir'
-import { fileExists } from '../lib/file-exists'
-import Watchpack from 'next/dist/compiled/watchpack'
-import stripAnsi from 'next/dist/compiled/strip-ansi'
-import { warn } from '../build/output/log'
-import { getPossibleInstrumentationHookFilenames } from '../build/utils'
+import { fileExists, FileType } from '../lib/file-exists'
 import { getNpxCommand } from '../lib/helpers/get-npx-command'
+import { createSelfSignedCertificate } from '../lib/mkcert'
+import type { SelfSignedCertificate } from '../lib/mkcert'
+import uploadTrace from '../trace/upload-trace'
+import { initialEnv } from '@next/env'
+import { fork } from 'child_process'
+import type { ChildProcess } from 'child_process'
+import {
+  getReservedPortExplanation,
+  isPortIsReserved,
+} from '../lib/helpers/get-reserved-port'
+import os from 'os'
+import { once } from 'node:events'
+import { clearTimeout } from 'timers'
+import { flushAllTraces, trace } from '../trace'
+import { traceId } from '../trace/shared'
 
+export type NextDevOptions = {
+  disableSourceMaps: boolean
+  turbo?: boolean
+  turbopack?: boolean
+  port: number
+  hostname?: string
+  experimentalHttps?: boolean
+  experimentalHttpsKey?: string
+  experimentalHttpsCert?: string
+  experimentalHttpsCa?: string
+  experimentalUploadTrace?: string
+}
+
+type PortSource = 'cli' | 'default' | 'env'
+
+let dir: string
+let child: undefined | ChildProcess
+let config: NextConfigComplete
 let isTurboSession = false
+let traceUploadUrl: string
 let sessionStopHandled = false
 let sessionStarted = Date.now()
-let dir: string
-let unwatchConfigFiles: () => void
+let sessionSpan = trace('next-dev')
 
-const isChildProcess = !!process.env.__NEXT_DEV_CHILD_PROCESS
+// How long should we wait for the child to cleanly exit after sending
+// SIGINT/SIGTERM to the child process before sending SIGKILL?
+const CHILD_EXIT_TIMEOUT_MS = parseInt(
+  process.env.NEXT_EXIT_TIMEOUT_MS ?? '100',
+  10
+)
 
-const handleSessionStop = async () => {
+const handleSessionStop = async (signal: NodeJS.Signals | number | null) => {
+  if (signal != null && child?.pid) child.kill(signal)
   if (sessionStopHandled) return
   sessionStopHandled = true
 
+  if (
+    signal != null &&
+    child?.pid &&
+    child.exitCode === null &&
+    child.signalCode === null
+  ) {
+    let exitTimeout = setTimeout(() => {
+      child?.kill('SIGKILL')
+    }, CHILD_EXIT_TIMEOUT_MS)
+    await once(child, 'exit').catch(() => {})
+    clearTimeout(exitTimeout)
+  }
+
+  sessionSpan.stop()
+  await flushAllTraces({ end: true })
+
   try {
-    const { eventCliSession } =
+    const { eventCliSessionStopped } =
       require('../telemetry/events/session-stopped') as typeof import('../telemetry/events/session-stopped')
 
-    const config = await loadConfig(
-      PHASE_DEVELOPMENT_SERVER,
-      dir,
-      undefined,
-      undefined,
-      true
-    )
+    config = config || (await loadConfig(PHASE_DEVELOPMENT_SERVER, dir))
 
     let telemetry =
       (traceGlobals.get('telemetry') as InstanceType<
@@ -63,13 +112,13 @@ const handleSessionStop = async () => {
       typeof traceGlobals.get('pagesDir') === 'undefined' ||
       typeof traceGlobals.get('appDir') === 'undefined'
     ) {
-      const pagesResult = findPagesDir(dir, !!config.experimental.appDir)
+      const pagesResult = findPagesDir(dir)
       appDir = !!pagesResult.appDir
       pagesDir = !!pagesResult.pagesDir
     }
 
     telemetry.record(
-      eventCliSession({
+      eventCliSessionStopped({
         cliCommand: 'dev',
         turboFlag: isTurboSession,
         durationMilliseconds: Date.now() - sessionStarted,
@@ -84,6 +133,16 @@ const handleSessionStop = async () => {
     // noise to the output
   }
 
+  if (traceUploadUrl) {
+    uploadTrace({
+      traceUploadUrl,
+      mode: 'dev',
+      projectDir: dir,
+      distDir: config.distDir,
+      isTurboSession,
+    })
+  }
+
   // ensure we re-enable the terminal cursor before exiting
   // the program, or the cursor could remain hidden
   process.stdout.write('\x1B[?25h')
@@ -91,87 +150,25 @@ const handleSessionStop = async () => {
   process.exit(0)
 }
 
-if (!isChildProcess) {
-  process.on('SIGINT', handleSessionStop)
-  process.on('SIGTERM', handleSessionStop)
-} else {
-  process.on('SIGINT', () => process.exit(0))
-  process.on('SIGTERM', () => process.exit(0))
-}
+process.on('SIGINT', () => handleSessionStop('SIGINT'))
+process.on('SIGTERM', () => handleSessionStop('SIGTERM'))
 
-function watchConfigFiles(dirToWatch: string) {
-  if (unwatchConfigFiles) {
-    unwatchConfigFiles()
-  }
+// exit event must be synchronous
+process.on('exit', () => child?.kill('SIGKILL'))
 
-  const wp = new Watchpack()
-  wp.watch({ files: CONFIG_FILES.map((file) => path.join(dirToWatch, file)) })
-  wp.on('change', (filename) => {
-    console.log(
-      `\n> Found a change in ${path.basename(
-        filename
-      )}. Restart the server to see the changes in effect.`
-    )
-  })
-  return () => wp.close()
-}
-
-const nextDev: CliCommand = async (argv) => {
-  const validArgs: arg.Spec = {
-    // Types
-    '--help': Boolean,
-    '--port': Number,
-    '--hostname': String,
-    '--turbo': Boolean,
-
-    // To align current messages with native binary.
-    // Will need to adjust subcommand later.
-    '--show-all': Boolean,
-    '--root': String,
-
-    // Aliases
-    '-h': '--help',
-    '-p': '--port',
-    '-H': '--hostname',
-  }
-  let args: arg.Result<arg.Spec>
-  try {
-    args = arg(validArgs, { argv })
-  } catch (error) {
-    if (isError(error) && error.code === 'ARG_UNKNOWN_OPTION') {
-      return printAndExit(error.message, 1)
-    }
-    throw error
-  }
-  if (args['--help']) {
-    console.log(`
-      Description
-        Starts the application in development mode (hot-code reloading, error
-        reporting, etc.)
-
-      Usage
-        $ next dev <dir> -p <port number>
-
-      <dir> represents the directory of the Next.js application.
-      If no directory is provided, the current directory will be used.
-
-      Options
-        --port, -p      A port number on which to start the application
-        --hostname, -H  Hostname on which to start the application (default: 0.0.0.0)
-        --help, -h      Displays this message
-    `)
-    process.exit(0)
-  }
-
-  dir = getProjectDir(process.env.NEXT_PRIVATE_DEV_DIR || args._[0])
-  unwatchConfigFiles = watchConfigFiles(dir)
+const nextDev = async (
+  options: NextDevOptions,
+  portSource: PortSource,
+  directory?: string
+) => {
+  dir = getProjectDir(process.env.NEXT_PRIVATE_DEV_DIR || directory)
 
   // Check if pages dir exists and warn if not
-  if (!(await fileExists(dir, 'directory'))) {
+  if (!(await fileExists(dir, FileType.Directory))) {
     printAndExit(`> No such directory exists as the project root: ${dir}`)
   }
 
-  async function preflight() {
+  async function preflight(skipOnReboot: boolean) {
     const { getPackageVersion, getDependencies } = (await Promise.resolve(
       require('../lib/get-package-version')
     )) as typeof import('../lib/get-package-version')
@@ -188,615 +185,204 @@ const nextDev: CliCommand = async (argv) => {
       )
     }
 
-    const { dependencies, devDependencies } = await getDependencies({
-      cwd: dir,
-    })
+    if (!skipOnReboot) {
+      const { dependencies, devDependencies } = await getDependencies({
+        cwd: dir,
+      })
 
-    // Warn if @next/font is installed as a dependency. Ignore `workspace:*` to not warn in the Next.js monorepo.
-    if (
-      dependencies['@next/font'] ||
-      (devDependencies['@next/font'] &&
-        devDependencies['@next/font'] !== 'workspace:*')
-    ) {
-      const command = getNpxCommand(dir)
-      Log.warn(
-        'Your project has `@next/font` installed as a dependency, please use the built-in `next/font` instead. ' +
-          'The `@next/font` package will be removed in Next.js 14. ' +
-          `You can migrate by running \`${command} @next/codemod@latest built-in-next-font .\`. Read more: https://nextjs.org/docs/messages/built-in-next-font`
-      )
+      // Warn if @next/font is installed as a dependency. Ignore `workspace:*` to not warn in the Next.js monorepo.
+      if (
+        dependencies['@next/font'] ||
+        (devDependencies['@next/font'] &&
+          devDependencies['@next/font'] !== 'workspace:*')
+      ) {
+        const command = getNpxCommand(dir)
+        Log.warn(
+          'Your project has `@next/font` installed as a dependency, please use the built-in `next/font` instead. ' +
+            'The `@next/font` package will be removed in Next.js 14. ' +
+            `You can migrate by running \`${command} @next/codemod@latest built-in-next-font .\`. Read more: https://nextjs.org/docs/messages/built-in-next-font`
+        )
+      }
     }
   }
 
-  const port = getPort(args)
+  let port = options.port
+
+  if (isPortIsReserved(port)) {
+    printAndExit(getReservedPortExplanation(port), 1)
+  }
+
   // If neither --port nor PORT were specified, it's okay to retry new ports.
-  const allowRetry =
-    args['--port'] === undefined && process.env.PORT === undefined
+  const allowRetry = portSource === 'default'
 
   // We do not set a default host value here to prevent breaking
   // some set-ups that rely on listening on other interfaces
-  const host = args['--hostname']
+  const host = options.hostname
 
-  const devServerOptions = {
-    allowRetry,
-    dev: true,
+  config = await loadConfig(PHASE_DEVELOPMENT_SERVER, dir)
+
+  if (
+    options.experimentalUploadTrace &&
+    !process.env.NEXT_TRACE_UPLOAD_DISABLED
+  ) {
+    traceUploadUrl = options.experimentalUploadTrace
+  }
+
+  const devServerOptions: StartServerOptions = {
     dir,
-    hostname: host,
-    isNextDevCommand: true,
     port,
+    allowRetry,
+    isDev: true,
+    hostname: host,
   }
 
-  const supportedTurbopackNextConfigOptions = [
-    'configFileName',
-    'env',
-    'experimental.appDir',
-    'experimental.serverComponentsExternalPackages',
-    'experimental.turbo',
-    'images',
-    'pageExtensions',
-    'onDemandEntries',
-    'rewrites',
-    'redirects',
-    'headers',
-    'reactStrictMode',
-    'swcMinify',
-    'transpilePackages',
-  ]
+  if (options.turbo || options.turbopack) {
+    process.env.TURBOPACK = '1'
+  }
 
-  // check for babelrc, swc plugins
-  async function validateNextConfig(isCustomTurbopack: boolean) {
-    const { getPkgManager } =
-      require('../lib/helpers/get-pkg-manager') as typeof import('../lib/helpers/get-pkg-manager')
-    const { getBabelConfigFile } =
-      require('../build/webpack-config') as typeof import('../build/webpack-config')
-    const { defaultConfig } =
-      require('../server/config-shared') as typeof import('../server/config-shared')
-    const chalk =
-      require('next/dist/compiled/chalk') as typeof import('next/dist/compiled/chalk')
-    const { interopDefault } =
-      require('../lib/interop-default') as typeof import('../lib/interop-default')
+  isTurboSession = !!process.env.TURBOPACK
 
-    // To regenerate the TURBOPACK gradient require('gradient-string')('blue', 'red')('>>> TURBOPACK')
-    const isTTY = process.stdout.isTTY
+  const distDir = path.join(dir, config.distDir ?? '.next')
+  setGlobal('phase', PHASE_DEVELOPMENT_SERVER)
+  setGlobal('distDir', distDir)
 
-    const turbopackGradient = `${chalk.bold(
-      isTTY
-        ? '\x1B[38;2;0;0;255m>\x1B[39m\x1B[38;2;23;0;232m>\x1B[39m\x1B[38;2;46;0;209m>\x1B[39m \x1B[38;2;70;0;185mT\x1B[39m\x1B[38;2;93;0;162mU\x1B[39m\x1B[38;2;116;0;139mR\x1B[39m\x1B[38;2;139;0;116mB\x1B[39m\x1B[38;2;162;0;93mO\x1B[39m\x1B[38;2;185;0;70mP\x1B[39m\x1B[38;2;209;0;46mA\x1B[39m\x1B[38;2;232;0;23mC\x1B[39m\x1B[38;2;255;0;0mK\x1B[39m'
-        : '>>> TURBOPACK'
-    )} ${chalk.dim('(alpha)')}\n\n`
+  const startServerPath = require.resolve('../server/lib/start-server')
 
-    let thankYouMsg = `Thank you for trying Next.js v13 with Turbopack! As a reminder,\nTurbopack is currently in alpha and not yet ready for production.\nWe appreciate your ongoing support as we work to make it ready\nfor everyone.\n`
+  async function startServer(startServerOptions: StartServerOptions) {
+    return new Promise<void>((resolve) => {
+      let resolved = false
+      const defaultEnv = (initialEnv || process.env) as typeof process.env
 
-    let unsupportedParts = ''
-    let babelrc = await getBabelConfigFile(dir)
-    if (babelrc) babelrc = path.basename(babelrc)
+      const nodeOptions = getParsedNodeOptionsWithoutInspect()
+      const nodeDebugType = getNodeDebugType()
 
-    let nonSupportedConfig: string[] = []
-    let rawNextConfig: NextConfig = {}
+      let maxOldSpaceSize: string | number | undefined = getMaxOldSpaceSize()
+      if (!maxOldSpaceSize && !process.env.NEXT_DISABLE_MEM_OVERRIDE) {
+        const totalMem = os.totalmem()
+        const totalMemInMB = Math.floor(totalMem / 1024 / 1024)
+        maxOldSpaceSize = Math.floor(totalMemInMB * 0.5).toString()
 
-    try {
-      rawNextConfig = interopDefault(
-        await loadConfig(PHASE_DEVELOPMENT_SERVER, dir, undefined, true)
-      ) as NextConfig
+        nodeOptions['max-old-space-size'] = maxOldSpaceSize
 
-      if (typeof rawNextConfig === 'function') {
-        rawNextConfig = (rawNextConfig as any)(PHASE_DEVELOPMENT_SERVER, {
-          defaultConfig,
-        })
+        // Ensure the max_old_space_size is not also set.
+        delete nodeOptions['max_old_space_size']
       }
 
-      const checkUnsupportedCustomConfig = (
-        configKey = '',
-        parentUserConfig: any,
-        parentDefaultConfig: any
-      ): boolean => {
-        try {
-          // these should not error
-          if (
-            // we only want the key after the dot for experimental options
-            supportedTurbopackNextConfigOptions
-              .map((key) => key.split('.').splice(-1)[0])
-              .includes(configKey)
-          ) {
-            return false
-          }
-          let userValue = parentUserConfig?.[configKey]
-          let defaultValue = parentDefaultConfig?.[configKey]
-
-          if (typeof defaultValue !== 'object') {
-            return defaultValue !== userValue
-          }
-          return Object.keys(userValue || {}).some((key: string) => {
-            return checkUnsupportedCustomConfig(key, userValue, defaultValue)
-          })
-        } catch (e) {
-          console.error(
-            `Unexpected error occurred while checking ${configKey}`,
-            e
-          )
-          return false
-        }
-      }
-
-      nonSupportedConfig = Object.keys(rawNextConfig).filter((key) =>
-        checkUnsupportedCustomConfig(key, rawNextConfig, defaultConfig)
-      )
-    } catch (e) {
-      console.error('Unexpected error occurred while checking config', e)
-    }
-
-    const hasWarningOrError = babelrc || nonSupportedConfig.length
-    if (!hasWarningOrError) {
-      thankYouMsg = chalk.dim(thankYouMsg)
-    }
-    if (!isCustomTurbopack) {
-      console.log(turbopackGradient + thankYouMsg)
-    }
-
-    let feedbackMessage = `Learn more about Next.js v13 and Turbopack: ${chalk.underline(
-      'https://nextjs.link/with-turbopack'
-    )}\nPlease direct feedback to: ${chalk.underline(
-      'https://nextjs.link/turbopack-feedback'
-    )}\n`
-
-    if (!hasWarningOrError) {
-      feedbackMessage = chalk.dim(feedbackMessage)
-    }
-
-    if (babelrc) {
-      unsupportedParts += `\n- Babel detected (${chalk.cyan(
-        babelrc
-      )})\n  ${chalk.dim(
-        `Babel is not yet supported. To use Turbopack at the moment,\n  you'll need to remove your usage of Babel.`
-      )}`
-    }
-    if (nonSupportedConfig.length) {
-      unsupportedParts += `\n\n- Unsupported Next.js configuration option(s) (${chalk.cyan(
-        'next.config.js'
-      )})\n  ${chalk.dim(
-        `The only configurations options supported are:\n${supportedTurbopackNextConfigOptions
-          .map((name) => `    - ${chalk.cyan(name)}\n`)
-          .join(
-            ''
-          )}  To use Turbopack, remove the following configuration options:\n${nonSupportedConfig.map(
-          (name) => `    - ${chalk.red(name)}\n`
-        )}`
-      )}   `
-    }
-
-    if (unsupportedParts && !isCustomTurbopack) {
-      const pkgManager = getPkgManager(dir)
-
-      console.error(
-        `${chalk.bold.red(
-          'Error:'
-        )} You are using configuration and/or tools that are not yet\nsupported by Next.js v13 with Turbopack:\n${unsupportedParts}\n
-If you cannot make the changes above, but still want to try out\nNext.js v13 with Turbopack, create the Next.js v13 playground app\nby running the following commands:
-
-  ${chalk.bold.cyan(
-    `${
-      pkgManager === 'npm'
-        ? 'npx create-next-app'
-        : `${pkgManager} create next-app`
-    } --example with-turbopack with-turbopack-app`
-  )}\n  cd with-turbopack-app\n  ${pkgManager} run dev
-        `
-      )
-
-      if (!isCustomTurbopack) {
-        console.warn(feedbackMessage)
-
-        process.exit(1)
+      if (options.disableSourceMaps) {
+        delete nodeOptions['enable-source-maps']
       } else {
-        console.warn(
-          `\n${chalk.bold.yellow(
-            'Warning:'
-          )} Unsupported config found; but continuing with custom Turbopack binary.\n`
-        )
-      }
-    }
-
-    if (!isCustomTurbopack) {
-      console.log(feedbackMessage)
-    }
-
-    return rawNextConfig
-  }
-
-  if (args['--turbo']) {
-    isTurboSession = true
-
-    const { loadBindings, __isCustomTurbopackBinary } =
-      require('../build/swc') as typeof import('../build/swc')
-    const { eventCliSession } =
-      require('../telemetry/events/version') as typeof import('../telemetry/events/version')
-    const { setGlobal } = require('../trace') as typeof import('../trace')
-    require('../telemetry/storage') as typeof import('../telemetry/storage')
-    const findUp =
-      require('next/dist/compiled/find-up') as typeof import('next/dist/compiled/find-up')
-
-    const isCustomTurbopack = await __isCustomTurbopackBinary()
-    const rawNextConfig = await validateNextConfig(isCustomTurbopack)
-
-    const distDir = path.join(dir, rawNextConfig.distDir || '.next')
-    const { pagesDir, appDir } = findPagesDir(
-      dir,
-      !!rawNextConfig.experimental?.appDir
-    )
-    const telemetry = new Telemetry({
-      distDir,
-    })
-    setGlobal('appDir', appDir)
-    setGlobal('pagesDir', pagesDir)
-    setGlobal('telemetry', telemetry)
-
-    if (!isCustomTurbopack) {
-      telemetry.record(
-        eventCliSession(distDir, rawNextConfig as NextConfigComplete, {
-          webpackVersion: 5,
-          cliCommand: 'dev',
-          isSrcDir: path
-            .relative(dir, pagesDir || appDir || '')
-            .startsWith('src'),
-          hasNowJson: !!(await findUp('now.json', { cwd: dir })),
-          isCustomServer: false,
-          turboFlag: true,
-          pagesDir: !!pagesDir,
-          appDir: !!appDir,
-        })
-      )
-    }
-
-    const turboJson = findUp.sync('turbo.json', { cwd: dir })
-    // eslint-disable-next-line no-shadow
-    const packagePath = findUp.sync('package.json', { cwd: dir })
-
-    let bindings: any = await loadBindings()
-    let server = bindings.turbo.startDev({
-      ...devServerOptions,
-      showAll: args['--show-all'] ?? false,
-      root:
-        args['--root'] ??
-        (turboJson
-          ? path.dirname(turboJson)
-          : packagePath
-          ? path.dirname(packagePath)
-          : undefined),
-    })
-    // Start preflight after server is listening and ignore errors:
-    preflight().catch(() => {})
-
-    if (!isCustomTurbopack) {
-      await telemetry.flush()
-    }
-    return server
-  } else {
-    // we're using a sub worker to avoid memory leaks. When memory usage exceeds 90%, we kill the worker and restart it.
-    // this is a temporary solution until we can fix the memory leaks.
-    // the logic for the worker killing itself is in `packages/next/server/lib/start-server.ts`
-    if (!process.env.__NEXT_DISABLE_MEMORY_WATCHER && !isChildProcess) {
-      let config: NextConfig
-      let childProcess: ChildProcess | null = null
-
-      const isDebugging = process.execArgv.some((localArg) =>
-        localArg.startsWith('--inspect')
-      )
-
-      const isDebuggingWithBrk = process.execArgv.some((localArg) =>
-        localArg.startsWith('--inspect-brk')
-      )
-
-      const debugPort = (() => {
-        const debugPortStr = process.execArgv
-          .find(
-            (localArg) =>
-              localArg.startsWith('--inspect') ||
-              localArg.startsWith('--inspect-brk')
-          )
-          ?.split('=')[1]
-        return debugPortStr ? parseInt(debugPortStr, 10) : 9229
-      })()
-
-      if (isDebugging || isDebuggingWithBrk) {
-        warn(
-          `the --inspect${
-            isDebuggingWithBrk ? '-brk' : ''
-          } option was detected, the Next.js server should be inspected at port ${
-            debugPort + 1
-          }.`
-        )
+        nodeOptions['enable-source-maps'] = true
       }
 
-      const genExecArgv = () => {
-        const execArgv = process.execArgv.filter((localArg) => {
-          return (
-            !localArg.startsWith('--inspect') &&
-            !localArg.startsWith('--inspect-brk')
-          )
-        })
-
-        if (isDebugging || isDebuggingWithBrk) {
-          execArgv.push(
-            `--inspect${isDebuggingWithBrk ? '-brk' : ''}=${debugPort + 1}`
-          )
-        }
-
-        return execArgv
-      }
-      let childProcessExitUnsub: (() => void) | null = null
-
-      const setupFork = (env?: NodeJS.ProcessEnv, newDir?: string) => {
-        childProcessExitUnsub?.()
-        childProcess?.kill()
-
-        const startDir = dir
-        const [, script, ...nodeArgs] = process.argv
-        let shouldFilter = false
-        childProcess = fork(
-          newDir ? script.replace(startDir, newDir) : script,
-          nodeArgs,
-          {
-            env: {
-              ...(env ? env : process.env),
-              FORCE_COLOR: '1',
-              __NEXT_DEV_CHILD_PROCESS: '1',
-            },
-            // @ts-ignore TODO: remove ignore when types are updated
-            windowsHide: true,
-            stdio: ['ipc', 'pipe', 'pipe'],
-            execArgv: genExecArgv(),
-          }
-        )
-
-        // since errors can start being logged from the fork
-        // before we detect the project directory rename
-        // attempt suppressing them long enough to check
-        const filterForkErrors = (chunk: Buffer, fd: 'stdout' | 'stderr') => {
-          const cleanChunk = stripAnsi(chunk + '')
-          if (
-            cleanChunk.match(
-              /(ENOENT|Module build failed|Module not found|Cannot find module)/
-            )
-          ) {
-            if (startDir === dir) {
-              try {
-                // check if start directory is still valid
-                const result = findPagesDir(
-                  startDir,
-                  !!config.experimental?.appDir
-                )
-                shouldFilter = !Boolean(result.pagesDir || result.appDir)
-              } catch (_) {
-                shouldFilter = true
-              }
-            }
-            if (shouldFilter || startDir !== dir) {
-              shouldFilter = true
-              return
-            }
-          }
-          process[fd].write(chunk)
-        }
-
-        childProcess?.stdout?.on('data', (chunk) => {
-          filterForkErrors(chunk, 'stdout')
-        })
-        childProcess?.stderr?.on('data', (chunk) => {
-          filterForkErrors(chunk, 'stderr')
-        })
-
-        const callback = async (code: number | null) => {
-          if (code === WORKER_SELF_EXIT_CODE) {
-            setupFork()
-          } else if (!sessionStopHandled) {
-            await handleSessionStop()
-            process.exit(1)
-          }
-        }
-        childProcess?.addListener('exit', callback)
-        childProcessExitUnsub = () =>
-          childProcess?.removeListener('exit', callback)
+      if (nodeDebugType) {
+        const address = getParsedDebugAddress()
+        address.port = address.port + 1
+        nodeOptions[nodeDebugType] = formatDebugAddress(address)
       }
 
-      setupFork()
-
-      config = await loadConfig(
-        PHASE_DEVELOPMENT_SERVER,
-        dir,
-        undefined,
-        undefined,
-        true
-      )
-
-      const handleProjectDirRename = (newDir: string) => {
-        process.chdir(newDir)
-        setupFork(
-          {
-            ...Object.keys(process.env).reduce((newEnv, key) => {
-              newEnv[key] = process.env[key]?.replace(dir, newDir)
-              return newEnv
-            }, {} as typeof process.env),
-            NEXT_PRIVATE_DEV_DIR: newDir,
-          },
-          newDir
-        )
-      }
-      const parentDir = path.join('/', dir, '..')
-      const watchedEntryLength = parentDir.split('/').length + 1
-      const previousItems = new Set<string>()
-
-      const instrumentationFilePaths = !!config.experimental
-        ?.instrumentationHook
-        ? getPossibleInstrumentationHookFilenames(dir, config.pageExtensions!)
-        : []
-
-      const instrumentationFileWatcher = new Watchpack({})
-
-      instrumentationFileWatcher.watch({
-        files: instrumentationFilePaths,
-        startTime: 0,
-      })
-
-      let instrumentationFileLastHash: string | undefined = undefined
-      const previousInstrumentationFiles = new Set<string>()
-      instrumentationFileWatcher.on('aggregated', async () => {
-        const knownFiles = instrumentationFileWatcher.getTimeInfoEntries()
-        const instrumentationFile = [...knownFiles.entries()].find(
-          ([key, value]) => instrumentationFilePaths.includes(key) && value
-        )?.[0]
-
-        if (instrumentationFile) {
-          const fs = require('fs') as typeof import('fs')
-          const instrumentationFileHash = (
-            require('crypto') as typeof import('crypto')
-          )
-            .createHash('sha256')
-            .update(await fs.promises.readFile(instrumentationFile, 'utf8'))
-            .digest('hex')
-
-          if (
-            instrumentationFileLastHash &&
-            instrumentationFileHash !== instrumentationFileLastHash
-          ) {
-            warn(
-              `The instrumentation file has changed, restarting the server to apply changes.`
-            )
-            return setupFork()
-          } else {
-            if (
-              !instrumentationFileLastHash &&
-              previousInstrumentationFiles.size !== 0
-            ) {
-              warn(
-                'The instrumentation file was added, restarting the server to apply changes.'
-              )
-              return setupFork()
-            }
-            instrumentationFileLastHash = instrumentationFileHash
-          }
-        } else if (
-          [...previousInstrumentationFiles.keys()].find((key) =>
-            instrumentationFilePaths.includes(key)
-          )
-        ) {
-          warn(
-            `The instrumentation file has been removed, restarting the server to apply changes.`
-          )
-          instrumentationFileLastHash = undefined
-          return setupFork()
-        }
-
-        previousInstrumentationFiles.clear()
-        knownFiles.forEach((_, key) => previousInstrumentationFiles.add(key))
-      })
-
-      const projectFolderWatcher = new Watchpack({
-        ignored: (entry: string) => {
-          return !(entry.split('/').length <= watchedEntryLength)
+      child = fork(startServerPath, {
+        stdio: 'inherit',
+        env: {
+          ...defaultEnv,
+          TURBOPACK: process.env.TURBOPACK,
+          NEXT_PRIVATE_WORKER: '1',
+          NEXT_PRIVATE_TRACE_ID: traceId,
+          NODE_EXTRA_CA_CERTS: startServerOptions.selfSignedCertificate
+            ? startServerOptions.selfSignedCertificate.rootCA
+            : defaultEnv.NODE_EXTRA_CA_CERTS,
+          NODE_OPTIONS: formatNodeOptions(nodeOptions),
+          // There is a node.js bug on MacOS which causes closing file watchers to be really slow.
+          // This limits the number of watchers to mitigate the issue.
+          // https://github.com/nodejs/node/issues/29949
+          WATCHPACK_WATCHER_LIMIT:
+            os.platform() === 'darwin' ? '20' : undefined,
         },
       })
 
-      projectFolderWatcher.watch({ directories: [parentDir], startTime: 0 })
-
-      projectFolderWatcher.on('aggregated', async () => {
-        const knownFiles = projectFolderWatcher.getTimeInfoEntries()
-        const newFiles: string[] = []
-        let hasPagesApp = false
-
-        // if the dir still exists nothing to check
-        try {
-          const result = findPagesDir(dir, !!config.experimental?.appDir)
-          hasPagesApp = Boolean(result.pagesDir || result.appDir)
-        } catch (err) {
-          // if findPagesDir throws validation error let this be
-          // handled in the dev-server itself in the fork
-          if ((err as any).message?.includes('experimental')) {
-            return
-          }
-        }
-
-        // try to find new dir introduced
-        if (previousItems.size) {
-          for (const key of knownFiles.keys()) {
-            if (!previousItems.has(key)) {
-              newFiles.push(key)
+      child.on('message', (msg: any) => {
+        if (msg && typeof msg === 'object') {
+          if (msg.nextWorkerReady) {
+            child?.send({ nextWorkerOptions: startServerOptions })
+          } else if (msg.nextServerReady && !resolved) {
+            if (msg.port) {
+              // Store the used port in case a random one was selected, so that
+              // it can be re-used on automatic dev server restarts.
+              port = parseInt(msg.port, 10)
             }
+
+            resolved = true
+            resolve()
           }
-          previousItems.clear()
-        }
-
-        for (const key of knownFiles.keys()) {
-          previousItems.add(key)
-        }
-
-        if (hasPagesApp) {
-          return
-        }
-
-        // if we failed to find the new dir it may have been moved
-        // to a new parent directory which we can't track as easily
-        // so exit gracefully
-        try {
-          const result = findPagesDir(
-            newFiles[0],
-            !!config.experimental?.appDir
-          )
-          hasPagesApp = Boolean(result.pagesDir || result.appDir)
-        } catch (_) {}
-
-        if (hasPagesApp && newFiles.length === 1) {
-          Log.info(
-            `Detected project directory rename, restarting in new location`
-          )
-          handleProjectDirRename(newFiles[0])
-          watchConfigFiles(newFiles[0])
-          dir = newFiles[0]
-        } else {
-          Log.error(
-            `Project directory could not be found, restart Next.js in your new directory`
-          )
-          process.exit(0)
         }
       })
-    } else {
-      startServer(devServerOptions)
-        .then(async (app) => {
-          const appUrl = `http://${app.hostname}:${app.port}`
-          const hostname = host || '0.0.0.0'
-          startedDevelopmentServer(
-            appUrl,
-            `${isIPv6(hostname) ? `[${hostname}]` : hostname}:${app.port}`
-          )
-          // Start preflight after server is listening and ignore errors:
-          preflight().catch(() => {})
-          // Finalize server bootup:
-          await app.prepare()
-        })
-        .catch((err) => {
-          if (err.code === 'EADDRINUSE') {
-            let errorMessage = `Port ${port} is already in use.`
-            const pkgAppPath = require('next/dist/compiled/find-up').sync(
-              'package.json',
-              {
-                cwd: dir,
-              }
-            )
-            const appPackage = require(pkgAppPath)
-            if (appPackage.scripts) {
-              const nextScript = Object.entries(appPackage.scripts).find(
-                (scriptLine) => scriptLine[1] === 'next'
-              )
-              if (nextScript) {
-                errorMessage += `\nUse \`npm run ${nextScript[0]} -- -p <some other port>\`.`
-              }
-            }
-            console.error(errorMessage)
-          } else {
-            console.error(err)
+
+      child.on('exit', async (code, signal) => {
+        if (sessionStopHandled || signal) {
+          return
+        }
+        if (code === RESTART_EXIT_CODE) {
+          // Starting the dev server will overwrite the `.next/trace` file, so we
+          // must upload the existing contents before restarting the server to
+          // preserve the metrics.
+          if (traceUploadUrl) {
+            uploadTrace({
+              traceUploadUrl,
+              mode: 'dev',
+              projectDir: dir,
+              distDir: config.distDir,
+              isTurboSession,
+              sync: true,
+            })
           }
-          process.nextTick(() => process.exit(1))
+
+          return startServer({ ...startServerOptions, port })
+        }
+        // Call handler (e.g. upload telemetry). Don't try to send a signal to
+        // the child, as it has already exited.
+        await handleSessionStop(/* signal */ null)
+      })
+    })
+  }
+
+  const runDevServer = async (reboot: boolean) => {
+    try {
+      if (!!options.experimentalHttps) {
+        Log.warn(
+          'Self-signed certificates are currently an experimental feature, use with caution.'
+        )
+
+        let certificate: SelfSignedCertificate | undefined
+
+        const key = options.experimentalHttpsKey
+        const cert = options.experimentalHttpsCert
+        const rootCA = options.experimentalHttpsCa
+
+        if (key && cert) {
+          certificate = {
+            key: path.resolve(key),
+            cert: path.resolve(cert),
+            rootCA: rootCA ? path.resolve(rootCA) : undefined,
+          }
+        } else {
+          certificate = await createSelfSignedCertificate(host)
+        }
+
+        await startServer({
+          ...devServerOptions,
+          selfSignedCertificate: certificate,
         })
+      } else {
+        await startServer(devServerOptions)
+      }
+
+      await preflight(reboot)
+    } catch (err) {
+      console.error(err)
+      process.exit(1)
     }
   }
+
+  await runDevServer(false)
 }
 
 export { nextDev }

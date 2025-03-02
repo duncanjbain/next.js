@@ -1,85 +1,67 @@
-/* global location */
+// imports polyfill from `@next/polyfill-module` after build.
 import '../build/polyfills/polyfill-module'
-// @ts-ignore react-dom/client exists when using React 18
+
+import './components/globals/patch-console'
+import './components/globals/handle-global-errors'
+
 import ReactDOMClient from 'react-dom/client'
 import React, { use } from 'react'
-import { createFromReadableStream } from 'next/dist/compiled/react-server-dom-webpack/client'
-
-import { HeadManagerContext } from '../shared/lib/head-manager-context'
-import { GlobalLayoutRouterContext } from '../shared/lib/app-router-context'
-import onRecoverableError from './on-recoverable-error'
+// eslint-disable-next-line import/no-extraneous-dependencies
+import { createFromReadableStream } from 'react-server-dom-webpack/client'
+import { HeadManagerContext } from '../shared/lib/head-manager-context.shared-runtime'
+import { onRecoverableError } from './react-client-callbacks/on-recoverable-error'
+import {
+  onCaughtError,
+  onUncaughtError,
+} from './react-client-callbacks/error-boundary-callbacks'
+import { callServer } from './app-call-server'
+import { findSourceMapURL } from './app-find-source-map-url'
+import {
+  type AppRouterActionQueue,
+  createMutableActionQueue,
+} from '../shared/lib/router/action-queue'
+import AppRouter from './components/app-router'
+import type { InitialRSCPayload } from '../server/app-render/types'
+import { createInitialRouterState } from './components/router-reducer/create-initial-router-state'
+import { MissingSlotContext } from '../shared/lib/app-router-context.shared-runtime'
+import { setAppBuildId } from './app-build-id'
+import { shouldRenderRootLevelErrorOverlay } from './lib/is-error-thrown-while-rendering-rsc'
 
 /// <reference types="react-dom/experimental" />
 
-// Override chunk URL mapping in the webpack runtime
-// https://github.com/webpack/webpack/blob/2738eebc7880835d88c727d364ad37f3ec557593/lib/RuntimeGlobals.js#L204
-
-declare global {
-  const __webpack_require__: any
-}
-
-// eslint-disable-next-line no-undef
-const getChunkScriptFilename = __webpack_require__.u
-const chunkFilenameMap: any = {}
-
-// eslint-disable-next-line no-undef
-__webpack_require__.u = (chunkId: any) => {
-  return encodeURI(chunkFilenameMap[chunkId] || getChunkScriptFilename(chunkId))
-}
-
-// Ignore the module ID transform in client.
-// eslint-disable-next-line no-undef
-// @ts-expect-error TODO: fix type
-self.__next_require__ =
-  process.env.NODE_ENV !== 'production'
-    ? (id: string) => {
-        const mod = __webpack_require__(id)
-        if (typeof mod === 'object') {
-          // Return a proxy to flight client to make sure it's always getting
-          // the latest module, instead of being cached.
-          return new Proxy(mod, {
-            get(_target, prop) {
-              return __webpack_require__(id)[prop]
-            },
-          })
-        }
-
-        return mod
-      }
-    : __webpack_require__
-
-// eslint-disable-next-line no-undef
-;(self as any).__next_chunk_load__ = (chunk: string) => {
-  if (!chunk) return Promise.resolve()
-  const [chunkId, chunkFileName] = chunk.split(':')
-  chunkFilenameMap[chunkId] = `static/chunks/${chunkFileName}.js`
-
-  // @ts-ignore
-  // eslint-disable-next-line no-undef
-  return __webpack_chunk_load__(chunkId)
-}
-
-const appElement: HTMLElement | Document | null = document
-
-const getCacheKey = () => {
-  const { pathname, search } = location
-  return pathname + search
-}
+const appElement: HTMLElement | Document = document
 
 const encoder = new TextEncoder()
 
-let initialServerDataBuffer: string[] | undefined = undefined
+let initialServerDataBuffer: (string | Uint8Array)[] | undefined = undefined
 let initialServerDataWriter: ReadableStreamDefaultController | undefined =
   undefined
 let initialServerDataLoaded = false
 let initialServerDataFlushed = false
 
-function nextServerDataCallback(
-  seg: [isBootStrap: 0] | [isNotBootstrap: 1, responsePartial: string]
-): void {
+let initialFormStateData: null | any = null
+
+type FlightSegment =
+  | [isBootStrap: 0]
+  | [isNotBootstrap: 1, responsePartial: string]
+  | [isFormState: 2, formState: any]
+  | [isBinary: 3, responseBase64Partial: string]
+
+type NextFlight = Omit<Array<FlightSegment>, 'push'> & {
+  push: (seg: FlightSegment) => void
+}
+
+declare global {
+  // If you're working in a browser environment
+  interface Window {
+    __next_f: NextFlight
+  }
+}
+
+function nextServerDataCallback(seg: FlightSegment): void {
   if (seg[0] === 0) {
     initialServerDataBuffer = []
-  } else {
+  } else if (seg[0] === 1) {
     if (!initialServerDataBuffer)
       throw new Error('Unexpected server data: missing bootstrap script.')
 
@@ -88,7 +70,30 @@ function nextServerDataCallback(
     } else {
       initialServerDataBuffer.push(seg[1])
     }
+  } else if (seg[0] === 2) {
+    initialFormStateData = seg[1]
+  } else if (seg[0] === 3) {
+    if (!initialServerDataBuffer)
+      throw new Error('Unexpected server data: missing bootstrap script.')
+
+    // Decode the base64 string back to binary data.
+    const binaryString = atob(seg[1])
+    const decodedChunk = new Uint8Array(binaryString.length)
+    for (var i = 0; i < binaryString.length; i++) {
+      decodedChunk[i] = binaryString.charCodeAt(i)
+    }
+
+    if (initialServerDataWriter) {
+      initialServerDataWriter.enqueue(decodedChunk)
+    } else {
+      initialServerDataBuffer.push(decodedChunk)
+    }
   }
+}
+
+function isStreamErrorOrUnfinished(ctr: ReadableStreamDefaultController) {
+  // If `desiredSize` is null, it means the stream is closed or errored. If it is lower than 0, the stream is still unfinished.
+  return ctr.desiredSize === null || ctr.desiredSize < 0
 }
 
 // There might be race conditions between `nextServerDataRegisterWriter` and
@@ -102,10 +107,18 @@ function nextServerDataCallback(
 function nextServerDataRegisterWriter(ctr: ReadableStreamDefaultController) {
   if (initialServerDataBuffer) {
     initialServerDataBuffer.forEach((val) => {
-      ctr.enqueue(encoder.encode(val))
+      ctr.enqueue(typeof val === 'string' ? encoder.encode(val) : val)
     })
     if (initialServerDataLoaded && !initialServerDataFlushed) {
-      ctr.close()
+      if (isStreamErrorOrUnfinished(ctr)) {
+        ctr.error(
+          new Error(
+            'The connection to the page was unexpectedly closed, possibly due to the stop button being clicked, loss of Wi-Fi, or an unstable internet connection.'
+          )
+        )
+      } else {
+        ctr.close()
+      }
       initialServerDataFlushed = true
       initialServerDataBuffer = undefined
     }
@@ -123,175 +136,150 @@ const DOMContentLoaded = function () {
   }
   initialServerDataLoaded = true
 }
+
 // It's possible that the DOM is already loaded.
 if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded', DOMContentLoaded, false)
 } else {
-  DOMContentLoaded()
+  // Delayed in marco task to ensure it's executed later than hydration
+  setTimeout(DOMContentLoaded)
 }
 
-const nextServerDataLoadingGlobal = ((self as any).__next_f =
-  (self as any).__next_f || [])
+const nextServerDataLoadingGlobal = (self.__next_f = self.__next_f || [])
 nextServerDataLoadingGlobal.forEach(nextServerDataCallback)
 nextServerDataLoadingGlobal.push = nextServerDataCallback
 
-function createResponseCache() {
-  return new Map<string, any>()
-}
-const rscCache = createResponseCache()
+const readable = new ReadableStream({
+  start(controller) {
+    nextServerDataRegisterWriter(controller)
+  },
+})
 
-function useInitialServerResponse(cacheKey: string): Promise<JSX.Element> {
-  const response = rscCache.get(cacheKey)
-  if (response) return response
+const initialServerResponse = createFromReadableStream<InitialRSCPayload>(
+  readable,
+  { callServer, findSourceMapURL }
+)
 
-  const readable = new ReadableStream({
-    start(controller) {
-      nextServerDataRegisterWriter(controller)
-    },
-  })
+// React overrides `.then` and doesn't return a new promise chain,
+// so we wrap the action queue in a promise to ensure that its value
+// is defined when the promise resolves.
+// https://github.com/facebook/react/blob/163365a07872337e04826c4f501565d43dbd2fd4/packages/react-client/src/ReactFlightClient.js#L189-L190
+const pendingActionQueue: Promise<AppRouterActionQueue> = new Promise(
+  (resolve, reject) => {
+    initialServerResponse.then(
+      (initialRSCPayload) => {
+        // setAppBuildId should be called only once, during JS initialization
+        // and before any components have hydrated.
+        setAppBuildId(initialRSCPayload.b)
 
-  const newResponse = createFromReadableStream(readable, {
-    async callServer(id: string, args: any[]) {
-      console.log('callServer', id, args)
+        resolve(
+          createMutableActionQueue(
+            createInitialRouterState({
+              initialFlightData: initialRSCPayload.f,
+              initialCanonicalUrlParts: initialRSCPayload.c,
+              initialParallelRoutes: new Map(),
+              location: window.location,
+              couldBeIntercepted: initialRSCPayload.i,
+              postponed: initialRSCPayload.s,
+              prerendered: initialRSCPayload.S,
+            })
+          )
+        )
+      },
+      (err: Error) => reject(err)
+    )
+  }
+)
 
-      const actionId = id
+function ServerRoot(): React.ReactNode {
+  const initialRSCPayload = use(initialServerResponse)
+  const actionQueue = use<AppRouterActionQueue>(pendingActionQueue)
 
-      // Fetching the current url with the action header.
-      // TODO: Refactor this to look up from a manifest.
-      const res = await fetch('', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Next-Action': actionId,
-        },
-        body: JSON.stringify({
-          bound: args,
-        }),
-      })
+  const router = (
+    <AppRouter
+      actionQueue={actionQueue}
+      globalErrorComponentAndStyles={initialRSCPayload.G}
+      assetPrefix={initialRSCPayload.p}
+    />
+  )
 
-      return res.json()
-    },
-  })
+  if (process.env.NODE_ENV === 'development' && initialRSCPayload.m) {
+    // We provide missing slot information in a context provider only during development
+    // as we log some additional information about the missing slots in the console.
+    return (
+      <MissingSlotContext value={initialRSCPayload.m}>
+        {router}
+      </MissingSlotContext>
+    )
+  }
 
-  rscCache.set(cacheKey, newResponse)
-  return newResponse
-}
-
-function ServerRoot({ cacheKey }: { cacheKey: string }): JSX.Element {
-  React.useEffect(() => {
-    rscCache.delete(cacheKey)
-  })
-  const response = useInitialServerResponse(cacheKey)
-  const root = use(response)
-  return root
+  return router
 }
 
 const StrictModeIfEnabled = process.env.__NEXT_STRICT_MODE_APP
   ? React.StrictMode
   : React.Fragment
 
-function Root({ children }: React.PropsWithChildren<{}>): React.ReactElement {
-  React.useEffect(() => {
-    if (process.env.__NEXT_ANALYTICS_ID) {
-      require('./performance-relayer-app')()
-    }
-  }, [])
-
+function Root({ children }: React.PropsWithChildren<{}>) {
   if (process.env.__NEXT_TEST_MODE) {
     // eslint-disable-next-line react-hooks/rules-of-hooks
     React.useEffect(() => {
       window.__NEXT_HYDRATED = true
-
-      if (window.__NEXT_HYDRATED_CB) {
-        window.__NEXT_HYDRATED_CB()
-      }
+      window.__NEXT_HYDRATED_CB?.()
     }, [])
   }
 
-  return children as React.ReactElement
+  return children
 }
 
-function RSCComponent(props: any): JSX.Element {
-  const cacheKey = getCacheKey()
-  return <ServerRoot {...props} cacheKey={cacheKey} />
+const reactRootOptions: ReactDOMClient.RootOptions = {
+  onRecoverableError,
+  onCaughtError,
+  onUncaughtError,
 }
 
 export function hydrate() {
-  if (process.env.NODE_ENV !== 'production') {
-    const rootLayoutMissingTagsError = (self as any)
-      .__next_root_layout_missing_tags_error
-    const HotReload: typeof import('./components/react-dev-overlay/hot-reloader-client').default =
-      require('./components/react-dev-overlay/hot-reloader-client')
-        .default as typeof import('./components/react-dev-overlay/hot-reloader-client').default
-
-    // Don't try to hydrate if root layout is missing required tags, render error instead
-    if (rootLayoutMissingTagsError) {
-      const reactRootElement = document.createElement('div')
-      document.body.appendChild(reactRootElement)
-      const reactRoot = (ReactDOMClient as any).createRoot(reactRootElement, {
-        onRecoverableError,
-      })
-
-      reactRoot.render(
-        <GlobalLayoutRouterContext.Provider
-          value={{
-            tree: rootLayoutMissingTagsError.tree,
-            changeByServerResponse: () => {},
-            focusAndScrollRef: {
-              apply: false,
-            },
-          }}
-        >
-          <HotReload
-            assetPrefix={rootLayoutMissingTagsError.assetPrefix}
-            // initialState={{
-            //   rootLayoutMissingTagsError: {
-            //     missingTags: rootLayoutMissingTagsError.missingTags,
-            //   },
-            // }}
-          />
-        </GlobalLayoutRouterContext.Provider>
-      )
-
-      return
-    }
-  }
-
   const reactEl = (
     <StrictModeIfEnabled>
-      <HeadManagerContext.Provider
-        value={{
-          appDir: true,
-        }}
-      >
+      <HeadManagerContext.Provider value={{ appDir: true }}>
         <Root>
-          <RSCComponent />
+          <ServerRoot />
         </Root>
       </HeadManagerContext.Provider>
     </StrictModeIfEnabled>
   )
 
-  const options = {
-    onRecoverableError,
-  }
-  const isError = document.documentElement.id === '__next_error__'
+  if (
+    document.documentElement.id === '__next_error__' ||
+    !!window.__next_root_layout_missing_tags?.length
+  ) {
+    let element = reactEl
+    // Server rendering failed, fall back to client-side rendering
+    if (
+      process.env.NODE_ENV !== 'production' &&
+      shouldRenderRootLevelErrorOverlay()
+    ) {
+      const { createRootLevelDevOverlayElement } =
+        require('./components/react-dev-overlay/app/client-entry') as typeof import('./components/react-dev-overlay/app/client-entry')
 
-  if (process.env.NODE_ENV !== 'production') {
-    // Patch console.error to collect information about hydration errors
-    const patchConsoleError =
-      require('./components/react-dev-overlay/internal/helpers/hydration-error-info')
-        .patchConsoleError as typeof import('./components/react-dev-overlay/internal/helpers/hydration-error-info').patchConsoleError
-    if (!isError) {
-      patchConsoleError()
+      // Note this won't cause hydration mismatch because we are doing CSR w/o hydration
+      element = createRootLevelDevOverlayElement(element)
     }
+
+    ReactDOMClient.createRoot(appElement, reactRootOptions).render(element)
+  } else {
+    React.startTransition(() => {
+      ReactDOMClient.hydrateRoot(appElement, reactEl, {
+        ...reactRootOptions,
+        formState: initialFormStateData,
+      })
+    })
   }
 
-  const reactRoot = isError
-    ? (ReactDOMClient as any).createRoot(appElement, options)
-    : (React as any).startTransition(() =>
-        (ReactDOMClient as any).hydrateRoot(appElement, reactEl, options)
-      )
-  if (isError) {
-    reactRoot.render(reactEl)
+  // TODO-APP: Remove this logic when Float has GC built-in in development.
+  if (process.env.NODE_ENV !== 'production') {
+    const { linkGc } =
+      require('./app-link-gc') as typeof import('./app-link-gc')
+    linkGc()
   }
 }

@@ -1,8 +1,14 @@
-export default {
+import createMdx from '@next/mdx'
+
+const withMdx = createMdx()
+
+export default withMdx({
   experimental: {
-    appDir: true,
     typedRoutes: true,
   },
+
+  pageExtensions: ['js', 'jsx', 'ts', 'tsx', 'mdx'],
+
   async rewrites() {
     return [
       {
@@ -34,6 +40,11 @@ export default {
         destination: 'https://nextjs.org',
         permanent: false,
       },
+      {
+        source: '/redirect(/v1)?/guides/:param/page',
+        destination: 'https://nextjs.org',
+        permanent: false,
+      },
     ]
   },
-}
+})

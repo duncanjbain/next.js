@@ -1,7 +1,5 @@
+/** @type {import('next').NextConfig} */
 module.exports = {
-  experimental: {
-    appDir: true,
-  },
   redirects: () => {
     return [
       {
@@ -11,4 +9,7 @@ module.exports = {
       },
     ]
   },
+  // scroll position can be finicky with the
+  // indicators showing so hide by default
+  devIndicators: false,
 }

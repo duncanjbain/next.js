@@ -1,6 +1,7 @@
 import React from 'react'
 import Head from '../shared/lib/head'
 import type { NextPageContext } from '../shared/lib/utils'
+import { getRequestMeta } from '../server/request-meta'
 
 const statusCodes: { [code: number]: string } = {
   400: 'Bad Request',
@@ -11,20 +12,35 @@ const statusCodes: { [code: number]: string } = {
 
 export type ErrorProps = {
   statusCode: number
+  hostname?: string
   title?: string
   withDarkMode?: boolean
 }
 
 function _getInitialProps({
+  req,
   res,
   err,
 }: NextPageContext): Promise<ErrorProps> | ErrorProps {
   const statusCode =
     res && res.statusCode ? res.statusCode : err ? err.statusCode! : 404
-  return { statusCode }
+
+  let hostname
+
+  if (typeof window !== 'undefined') {
+    hostname = window.location.hostname
+  } else if (req) {
+    const initUrl = getRequestMeta(req, 'initURL')
+    if (initUrl) {
+      const url = new URL(initUrl)
+      hostname = url.hostname
+    }
+  }
+
+  return { statusCode, hostname }
 }
 
-const styles: { [k: string]: React.CSSProperties } = {
+const styles: Record<string, React.CSSProperties> = {
   error: {
     // https://github.com/sindresorhus/modern-normalize/blob/main/modern-normalize.css#L38-L52
     fontFamily:
@@ -36,12 +52,9 @@ const styles: { [k: string]: React.CSSProperties } = {
     alignItems: 'center',
     justifyContent: 'center',
   },
-
   desc: {
-    display: 'inline-block',
-    textAlign: 'left',
+    lineHeight: '48px',
   },
-
   h1: {
     display: 'inline-block',
     margin: '0 20px 0 0',
@@ -49,14 +62,14 @@ const styles: { [k: string]: React.CSSProperties } = {
     fontSize: 24,
     fontWeight: 500,
     verticalAlign: 'top',
-    lineHeight: '49px',
   },
-
   h2: {
     fontSize: 14,
     fontWeight: 400,
-    lineHeight: '49px',
-    margin: 0,
+    lineHeight: '28px',
+  },
+  wrap: {
+    display: 'inline-block',
   },
 }
 
@@ -85,7 +98,7 @@ export default class Error<P = {}> extends React.Component<P & ErrorProps> {
               : 'Application error: a client-side exception has occurred'}
           </title>
         </Head>
-        <div>
+        <div style={styles.desc}>
           <style
             dangerouslySetInnerHTML={{
               /* CSS minified from
@@ -118,14 +131,17 @@ export default class Error<P = {}> extends React.Component<P & ErrorProps> {
               {statusCode}
             </h1>
           ) : null}
-          <div style={styles.desc}>
+          <div style={styles.wrap}>
             <h2 style={styles.h2}>
               {this.props.title || statusCode ? (
                 title
               ) : (
                 <>
-                  Application error: a client-side exception has occurred (see
-                  the browser console for more information)
+                  Application error: a client-side exception has occurred{' '}
+                  {Boolean(this.props.hostname) && (
+                    <>while loading {this.props.hostname}</>
+                  )}{' '}
+                  (see the browser console for more information)
                 </>
               )}
               .

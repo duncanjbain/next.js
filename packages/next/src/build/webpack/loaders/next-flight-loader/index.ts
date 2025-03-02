@@ -1,12 +1,58 @@
-import { RSC_MODULE_TYPES } from '../../../../shared/lib/constants'
+import type { NormalModule, webpack } from 'next/dist/compiled/webpack/webpack'
+import { RSC_MOD_REF_PROXY_ALIAS } from '../../../../lib/constants'
+import {
+  BARREL_OPTIMIZATION_PREFIX,
+  RSC_MODULE_TYPES,
+} from '../../../../shared/lib/constants'
 import { warnOnce } from '../../../../shared/lib/utils/warn-once'
 import { getRSCModuleInformation } from '../../../analysis/get-page-static-info'
+import { formatBarrelOptimizedResource } from '../../utils'
 import { getModuleBuildInfo } from '../get-module-build-info'
+import type {
+  javascript,
+  LoaderContext,
+} from 'next/dist/compiled/webpack/webpack'
+
+type SourceType = javascript.JavascriptParser['sourceType'] | 'commonjs'
 
 const noopHeadPath = require.resolve('next/dist/client/components/noop-head')
+// For edge runtime it will be aliased to esm version by webpack
+const MODULE_PROXY_PATH =
+  'next/dist/build/webpack/loaders/next-flight-loader/module-proxy'
 
-export default async function transformSource(
-  this: any,
+export function getAssumedSourceType(
+  mod: webpack.Module,
+  sourceType: SourceType
+): SourceType {
+  const buildInfo = getModuleBuildInfo(mod)
+  const detectedClientEntryType = buildInfo?.rsc?.clientEntryType
+  const clientRefs = buildInfo?.rsc?.clientRefs || []
+
+  // It's tricky to detect the type of a client boundary, but we should always
+  // use the `module` type when we can, to support `export *` and `export from`
+  // syntax in other modules that import this client boundary.
+
+  if (sourceType === 'auto') {
+    if (detectedClientEntryType === 'auto') {
+      if (clientRefs.length === 0) {
+        // If there's zero export detected in the client boundary, and it's the
+        // `auto` type, we can safely assume it's a CJS module because it doesn't
+        // have ESM exports.
+        return 'commonjs'
+      } else if (!clientRefs.includes('*')) {
+        // Otherwise, we assume it's an ESM module.
+        return 'module'
+      }
+    } else if (detectedClientEntryType === 'cjs') {
+      return 'commonjs'
+    }
+  }
+
+  return sourceType
+}
+
+export default function transformSource(
+  this: LoaderContext<undefined>,
   source: string,
   sourceMap: any
 ) {
@@ -14,61 +60,128 @@ export default async function transformSource(
   if (typeof source !== 'string') {
     throw new Error('Expected source to have been transformed to a string.')
   }
-
-  const callback = this.async()
+  const module = this._module!
 
   // Assign the RSC meta information to buildInfo.
   // Exclude next internal files which are not marked as client files
-  const buildInfo = getModuleBuildInfo(this._module)
-  buildInfo.rsc = getRSCModuleInformation(source)
+  const buildInfo = getModuleBuildInfo(module)
+  buildInfo.rsc = getRSCModuleInformation(source, true)
+  let prefix = ''
+  if (process.env.BUILTIN_FLIGHT_CLIENT_ENTRY_PLUGIN) {
+    const rscModuleInformationJson = JSON.stringify(buildInfo.rsc)
+    prefix = `/* __rspack_internal_rsc_module_information_do_not_use__ ${rscModuleInformationJson} */\n`
+    source = prefix + source
+  }
 
-  const isESM = this._module?.parser?.sourceType === 'module'
+  // Resource key is the unique identifier for the resource. When RSC renders
+  // a client module, that key is used to identify that module across all compiler
+  // layers.
+  //
+  // Usually it's the module's file path + the export name (e.g. `foo.js#bar`).
+  // But with Barrel Optimizations, one file can be splitted into multiple modules,
+  // so when you import `foo.js#bar` and `foo.js#baz`, they are actually different
+  // "foo.js" being created by the Barrel Loader (one only exports `bar`, the other
+  // only exports `baz`).
+  //
+  // Because of that, we must add another query param to the resource key to
+  // differentiate them.
+  let resourceKey: string = this.resourcePath
+  if (module.matchResource?.startsWith(BARREL_OPTIMIZATION_PREFIX)) {
+    resourceKey = formatBarrelOptimizedResource(
+      resourceKey,
+      module.matchResource
+    )
+  }
 
   // A client boundary.
-  if (isESM && buildInfo.rsc?.type === RSC_MODULE_TYPES.client) {
+  if (buildInfo.rsc?.type === RSC_MODULE_TYPES.client) {
+    const assumedSourceType = getAssumedSourceType(
+      module,
+      sourceTypeFromModule(module)
+    )
+
     const clientRefs = buildInfo.rsc.clientRefs!
-    if (clientRefs.includes('*')) {
-      return callback(
-        new Error(
-          `It's currently unsupport to use "export *" in a client boundary. Please use named exports instead.`
-        )
-      )
-    }
+    const stringifiedResourceKey = JSON.stringify(resourceKey)
 
-    // For ESM, we can't simply export it as a proxy via `module.exports`.
-    // Use multiple named exports instead.
-    const proxyFilepath = source.match(/createProxy\((.+)\)/)?.[1]
-    if (!proxyFilepath) {
-      return callback(
-        new Error(
-          `Failed to find the proxy file path in the client boundary. This is a bug in Next.js.`
-        )
-      )
-    }
-
-    let esmSource = `
-    import { createProxy } from "private-next-rsc-mod-ref-proxy"
-    const proxy = createProxy(${proxyFilepath})
-    `
-    let cnt = 0
-    for (const ref of clientRefs) {
-      if (ref === 'default') {
-        esmSource += `\nexport default proxy.default`
-      } else {
-        esmSource += `\nconst e${cnt} = proxy["${ref}"]\nexport { e${cnt++} as ${ref} }`
+    if (assumedSourceType === 'module') {
+      if (clientRefs.length === 0) {
+        return this.callback(null, 'export {}')
       }
-    }
 
-    return callback(null, esmSource, sourceMap)
+      if (clientRefs.includes('*')) {
+        this.callback(
+          new Error(
+            `It's currently unsupported to use "export *" in a client boundary. Please use named exports instead.`
+          )
+        )
+        return
+      }
+
+      let esmSource =
+        prefix +
+        `\
+import { registerClientReference } from "react-server-dom-webpack/server.edge";
+`
+      for (const ref of clientRefs) {
+        if (ref === 'default') {
+          esmSource += `export default registerClientReference(
+function() { throw new Error(${JSON.stringify(`Attempted to call the default \
+export of ${stringifiedResourceKey} from the server, but it's on the client. \
+It's not possible to invoke a client function from the server, it can only be \
+rendered as a Component or passed to props of a Client Component.`)}); },
+${stringifiedResourceKey},
+"default",
+);\n`
+        } else {
+          esmSource += `export const ${ref} = registerClientReference(
+function() { throw new Error(${JSON.stringify(`Attempted to call ${ref}() from \
+the server but ${ref} is on the client. It's not possible to invoke a client \
+function from the server, it can only be rendered as a Component or passed to \
+props of a Client Component.`)}); },
+${stringifiedResourceKey},
+${JSON.stringify(ref)},
+);`
+        }
+      }
+
+      return this.callback(null, esmSource, sourceMap)
+    } else if (assumedSourceType === 'commonjs') {
+      let cjsSource =
+        prefix +
+        `\
+const { createProxy } = require("${MODULE_PROXY_PATH}")
+
+module.exports = createProxy(${stringifiedResourceKey})
+`
+      return this.callback(null, cjsSource, sourceMap)
+    }
   }
 
   if (buildInfo.rsc?.type !== RSC_MODULE_TYPES.client) {
     if (noopHeadPath === this.resourcePath) {
       warnOnce(
-        `Warning: You're using \`next/head\` inside the \`app\` directory, please migrate to the Metadata API. See https://beta.nextjs.org/docs/api-reference/metadata for more details.`
+        `Warning: You're using \`next/head\` inside the \`app\` directory, please migrate to the Metadata API. See https://nextjs.org/docs/app/building-your-application/upgrading/app-router-migration#step-3-migrating-nexthead for more details.`
       )
     }
   }
 
-  return callback(null, source, sourceMap)
+  const replacedSource = source.replace(
+    RSC_MOD_REF_PROXY_ALIAS,
+    MODULE_PROXY_PATH
+  )
+  this.callback(null, replacedSource, sourceMap)
+}
+
+function sourceTypeFromModule(module: NormalModule): SourceType {
+  const moduleType = module.type
+  switch (moduleType) {
+    case 'javascript/auto':
+      return 'auto'
+    case 'javascript/dynamic':
+      return 'script'
+    case 'javascript/esm':
+      return 'module'
+    default:
+      throw new Error('Unexpected module type ' + moduleType)
+  }
 }

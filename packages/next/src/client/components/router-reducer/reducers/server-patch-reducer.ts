@@ -1,39 +1,29 @@
 import { createHrefFromUrl } from '../create-href-from-url'
 import { applyRouterStatePatchToTree } from '../apply-router-state-patch-to-tree'
 import { isNavigatingToNewRootLayout } from '../is-navigating-to-new-root-layout'
-import {
+import type {
   ServerPatchAction,
   ReducerState,
   ReadonlyReducerState,
+  Mutable,
 } from '../router-reducer-types'
-import {
-  handleMutable,
-  applyFlightData,
-  handleExternalUrl,
-} from './navigate-reducer'
+import { handleExternalUrl } from './navigate-reducer'
+import { applyFlightData } from '../apply-flight-data'
+import { handleMutable } from '../handle-mutable'
+import type { CacheNode } from '../../../../shared/lib/app-router-context.shared-runtime'
+import { createEmptyCacheNode } from '../../app-router'
 
 export function serverPatchReducer(
   state: ReadonlyReducerState,
   action: ServerPatchAction
 ): ReducerState {
-  const { flightData, previousTree, overrideCanonicalUrl, cache, mutable } =
-    action
+  const {
+    serverResponse: { flightData, canonicalUrl: canonicalUrlOverride },
+  } = action
 
-  const isForCurrentTree =
-    JSON.stringify(previousTree) === JSON.stringify(state.tree)
+  const mutable: Mutable = {}
 
-  // When a fetch is slow to resolve it could be that you navigated away while the request was happening or before the reducer runs.
-  // In that case opt-out of applying the patch given that the data could be stale.
-  if (!isForCurrentTree) {
-    // TODO-APP: Handle tree mismatch
-    console.log('TREE MISMATCH')
-    // Keep everything as-is.
-    return state
-  }
-
-  if (mutable.previousTree) {
-    return handleMutable(state, mutable)
-  }
+  mutable.preserveCustomHistoryState = false
 
   // Handle case when navigating to page in `pages` from `app`
   if (typeof flightData === 'string') {
@@ -45,46 +35,56 @@ export function serverPatchReducer(
     )
   }
 
-  // TODO-APP: Currently the Flight data can only have one item but in the future it can have multiple paths.
-  const flightDataPath = flightData[0]
+  let currentTree = state.tree
+  let currentCache = state.cache
 
-  // Slices off the last segment (which is at -4) as it doesn't exist in the tree yet
-  const flightSegmentPath = flightDataPath.slice(0, -4)
-  const [treePatch] = flightDataPath.slice(-3, -2)
+  for (const normalizedFlightData of flightData) {
+    const { segmentPath: flightSegmentPath, tree: treePatch } =
+      normalizedFlightData
 
-  const newTree = applyRouterStatePatchToTree(
-    // TODO-APP: remove ''
-    ['', ...flightSegmentPath],
-    state.tree,
-    treePatch
-  )
-
-  if (newTree === null) {
-    throw new Error('SEGMENT MISMATCH')
-  }
-
-  if (isNavigatingToNewRootLayout(state.tree, newTree)) {
-    return handleExternalUrl(
-      state,
-      mutable,
-      state.canonicalUrl,
-      state.pushRef.pendingPush
+    const newTree = applyRouterStatePatchToTree(
+      // TODO-APP: remove ''
+      ['', ...flightSegmentPath],
+      currentTree,
+      treePatch,
+      state.canonicalUrl
     )
+
+    // `applyRouterStatePatchToTree` returns `null` when it determined that the server response is not applicable to the current tree.
+    // In other words, the server responded with a tree that doesn't match what the client is currently rendering.
+    // This can happen if the server patch action took longer to resolve than a subsequent navigation which would have changed the tree.
+    // Previously this case triggered an MPA navigation but it should be safe to simply discard the server response rather than forcing
+    // the entire page to reload.
+    if (newTree === null) {
+      return state
+    }
+
+    if (isNavigatingToNewRootLayout(currentTree, newTree)) {
+      return handleExternalUrl(
+        state,
+        mutable,
+        state.canonicalUrl,
+        state.pushRef.pendingPush
+      )
+    }
+
+    const canonicalUrlOverrideHref = canonicalUrlOverride
+      ? createHrefFromUrl(canonicalUrlOverride)
+      : undefined
+
+    if (canonicalUrlOverrideHref) {
+      mutable.canonicalUrl = canonicalUrlOverrideHref
+    }
+
+    const cache: CacheNode = createEmptyCacheNode()
+    applyFlightData(currentCache, cache, normalizedFlightData)
+
+    mutable.patchedTree = newTree
+    mutable.cache = cache
+
+    currentCache = cache
+    currentTree = newTree
   }
-
-  const canonicalUrlOverrideHref = overrideCanonicalUrl
-    ? createHrefFromUrl(overrideCanonicalUrl)
-    : undefined
-
-  if (canonicalUrlOverrideHref) {
-    mutable.canonicalUrl = canonicalUrlOverrideHref
-  }
-
-  applyFlightData(state, cache, flightDataPath)
-
-  mutable.previousTree = state.tree
-  mutable.patchedTree = newTree
-  mutable.cache = cache
 
   return handleMutable(state, mutable)
 }

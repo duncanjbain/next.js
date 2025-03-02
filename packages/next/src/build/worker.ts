@@ -1,3 +1,8 @@
-export * from './utils'
-import exportPage from '../export/worker'
-export { exportPage }
+import '../server/require-hook'
+
+export {
+  getDefinedNamedExports,
+  hasCustomGetInitialProps,
+  isPageStatic,
+} from './utils'
+export { exportPages } from '../export/worker'
